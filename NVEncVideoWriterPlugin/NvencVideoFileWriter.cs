@@ -99,10 +99,18 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
         {
             if (_encoderHandle != IntPtr.Zero)
             {
-                var finalizeResult = NvencNativeMethods.NvencFinalize(_encoderHandle);
-                var finalizeError = finalizeResult == 0 ? GetNativeError() : string.Empty;
-                NvencNativeMethods.NvencDestroy(_encoderHandle);
-                _encoderHandle = IntPtr.Zero;
+                var finalizeResult = 0;
+                var finalizeError = string.Empty;
+                try
+                {
+                    finalizeResult = NvencNativeMethods.NvencFinalize(_encoderHandle);
+                    finalizeError = finalizeResult == 0 ? GetNativeError() : string.Empty;
+                }
+                finally
+                {
+                    NvencNativeMethods.NvencDestroy(_encoderHandle);
+                    _encoderHandle = IntPtr.Zero;
+                }
                 if (finalizeResult == 0)
                 {
                     throw new InvalidOperationException(string.IsNullOrWhiteSpace(finalizeError)
@@ -211,7 +219,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
             Format.B8G8R8A8_UNorm_SRgb => NvencBufferFormat.ARGB,
             Format.R8G8B8A8_UNorm => NvencBufferFormat.ABGR,
             Format.R8G8B8A8_UNorm_SRgb => NvencBufferFormat.ABGR,
-            _ => NvencBufferFormat.ARGB,
+            _ => throw new NotSupportedException($"NVENC does not support the input texture format {format}."),
         };
     }
 

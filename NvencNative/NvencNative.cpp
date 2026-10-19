@@ -253,6 +253,8 @@ namespace
         IMFTransform* aacEncoder = nullptr;
         std::wstring outputPath;
         std::wstring lastError;
+        std::mutex errorMutex;
+        uint64_t completedFrames = 0;
         bool logEnabled = false;
         HANDLE logFile = INVALID_HANDLE_VALUE;
     };
@@ -290,11 +292,28 @@ namespace
     void StartWriterThread(EncoderState* state);
     void StopWriterThread(EncoderState* state);
 
+    bool HasError(EncoderState* state)
+    {
+        if (!state)
+        {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(state->errorMutex);
+        return !state->lastError.empty();
+    }
+
     void SetError(EncoderState* state, const std::wstring& message)
     {
         if (state)
         {
-            state->lastError = message;
+            {
+                std::lock_guard<std::mutex> lock(state->errorMutex);
+                if (state->lastError.empty())
+                {
+                    // Preserve the originating failure.
+                    state->lastError = message;
+                }
+            }
             LogLine(state, L"[error] " + message);
         }
     }
@@ -984,7 +1003,7 @@ namespace
         buffer.EndBox(sttsStart);
     }
 
-    void AppendAudioTrak(Mp4Buffer& moov, const EncoderState* state, uint32_t trackId)
+    void AppendAudioTrak(Mp4Buffer& moov, const EncoderState* state, uint32_t trackId, uint32_t movieTimescale)
     {
         const uint32_t timescale = static_cast<uint32_t>(state->audioSampleRate);
         const uint64_t duration = state->audioSampleTotal;
@@ -999,7 +1018,9 @@ namespace
         moov.WriteU32(0);
         moov.WriteU32(trackId);
         moov.WriteU32(0);
-        moov.WriteU32(static_cast<uint32_t>(duration));
+        // tkhd uses the movie clock; mdhd and stts below use the audio clock.
+        const uint64_t trackDuration = duration * movieTimescale / timescale;
+        moov.WriteU32(static_cast<uint32_t>(trackDuration));
         moov.WriteU32(0);
         moov.WriteU32(0);
         moov.WriteU16(0);
@@ -1348,7 +1369,7 @@ namespace
 
         if (!state->audioSampleSizes.empty() && !state->audioSpecificConfig.empty())
         {
-            AppendAudioTrak(moov, state, 2);
+            AppendAudioTrak(moov, state, 2, timescale);
         }
         moov.EndBox(moovStart);
 
@@ -1370,7 +1391,7 @@ namespace
         StopWriterThread(state);
         if (state->writerError)
         {
-            if (state->lastError.empty())
+            if (!HasError(state))
             {
                 SetError(state, L"Writer thread error.");
             }
@@ -1379,7 +1400,14 @@ namespace
 
         if (state->codecPrivate.empty())
         {
-            SetError(state, L"Video codec header not found.");
+            if (!HasError(state))
+            {
+                SetError(state, L"Video codec header not found.");
+            }
+            else
+            {
+                LogLine(state, L"[error] Video codec header not found (secondary error; preserving the earlier failure).");
+            }
             return false;
         }
 
@@ -2309,6 +2337,7 @@ namespace
                 bool ok = true;
                 if (lockBitstream.bitstreamSizeInBytes > 0)
                 {
+                    ++state->completedFrames;
                     ok = ProcessEncodedBitstream(state,
                         static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
                         lockBitstream.bitstreamSizeInBytes,
@@ -2747,9 +2776,42 @@ namespace
         return true;
     }
 
+    bool ValidateInputTexture(EncoderState* state, ID3D11Texture2D* texture)
+    {
+        D3D11_TEXTURE2D_DESC desc{};
+        texture->GetDesc(&desc);
+
+        bool formatOk = false;
+        if (state->originalBufferFormat == NV_ENC_BUFFER_FORMAT_ARGB)
+        {
+            formatOk = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        }
+        else if (state->originalBufferFormat == NV_ENC_BUFFER_FORMAT_ABGR)
+        {
+            formatOk = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        }
+
+        if (desc.MipLevels != 1
+            || desc.ArraySize != 1
+            || desc.SampleDesc.Count != 1
+            || desc.Width != static_cast<UINT>(state->width)
+            || desc.Height != static_cast<UINT>(state->height)
+            || !formatOk)
+        {
+            SetError(state, L"Input texture dimensions or format changed during export.");
+            return false;
+        }
+        return true;
+    }
+
     bool EncodeTexture(EncoderState* state, ID3D11Texture2D* texture)
     {
         if (!state || !texture)
+        {
+            return false;
+        }
+
+        if (!ValidateInputTexture(state, texture))
         {
             return false;
         }
@@ -2870,6 +2932,10 @@ namespace
             return false;
         }
 
+        if (lockBitstream.bitstreamSizeInBytes > 0)
+        {
+            ++state->completedFrames;
+        }
         bool ok = ProcessEncodedBitstream(state,
             static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
             lockBitstream.bitstreamSizeInBytes,
@@ -3302,6 +3368,14 @@ int NvencFinalize(void* handle)
         LogLine(state, L"encode EOS submitted");
     }
 
+    LogLine(state, L"nvenc finalize frames submitted=" + std::to_wstring(state->frameIndex)
+        + L" completed=" + std::to_wstring(state->completedFrames));
+    if (state->completedFrames != state->frameIndex)
+    {
+        SetError(state, L"NVENC completed-frame count does not match submitted input count.");
+        return 0;
+    }
+
     if (!FinalizeMp4(state))
     {
         return 0;
@@ -3432,5 +3506,9 @@ const wchar_t* NvencGetLastError(void* handle)
     {
         return L"";
     }
-    return state->lastError.c_str();
+    // Snapshot rather than returning a string that may be modified concurrently.
+    thread_local std::wstring snapshot;
+    std::lock_guard<std::mutex> lock(state->errorMutex);
+    snapshot = state->lastError;
+    return snapshot.c_str();
 }
