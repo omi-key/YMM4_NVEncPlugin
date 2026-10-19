@@ -70,7 +70,8 @@ function Get-NormalizedPath {
         [string]$Path
     )
 
-    if ([System.IO.Path]::IsPathFullyQualified($Path)) {
+    # IsPathFullyQualified exists only on .NET Core / PowerShell 7; IsPathRooted works on Windows PowerShell 5.1 too.
+    if ([System.IO.Path]::IsPathRooted($Path)) {
         return [System.IO.Path]::GetFullPath($Path)
     }
     return [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Path))
