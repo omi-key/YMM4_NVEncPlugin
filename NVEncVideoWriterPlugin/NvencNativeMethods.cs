@@ -90,6 +90,15 @@ internal struct NativeProfileSnapshot
         "finalize", "mp4_finalize", "slot_residence",
     ];
 
+    // Cumulative counters used by the timeline (slot_wait, encode_picture, output_event_wait, lock_bitstream, bitstream_mux).
+    public NativeTotals ToTimelineTotals()
+    {
+        if (Version != 1 || MetricCount != StageNames.Length || Metrics is null || Metrics.Length != StageNames.Length)
+            throw new InvalidOperationException("NVENCプロファイリングのDLLバージョンが一致しません。");
+        return new NativeTotals(Metrics[0].TotalNanoseconds, Metrics[3].TotalNanoseconds, Metrics[4].TotalNanoseconds,
+            Metrics[5].TotalNanoseconds, Metrics[6].TotalNanoseconds);
+    }
+
     public object ToReport()
     {
         if (Version != 1 || MetricCount != StageNames.Length || Metrics is null || Metrics.Length != StageNames.Length)

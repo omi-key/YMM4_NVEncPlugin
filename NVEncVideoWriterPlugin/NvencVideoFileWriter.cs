@@ -137,6 +137,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
                     throw new InvalidOperationException(GetNativeError());
                 }
                 _profile?.SubmittedVideo();
+                if (_profile is not null && _profile.TimelineSnapshotWanted) CaptureTimelineSnapshot();
             }
         }
         catch (Exception exception) { _profile?.Failed(exception); throw; }
@@ -195,6 +196,25 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
         }
     }
 
+    // Once per timeline bucket boundary, under the encode lock. Never throws; failure just omits native deltas.
+    private void CaptureTimelineSnapshot()
+    {
+        try
+        {
+            if (NvencNativeMethods.NvencGetProfile(_encoderHandle, out var snapshot, (uint)Marshal.SizeOf<NativeProfileSnapshot>()) == 0)
+            {
+                _profile!.TimelineNativeUnavailable();
+                return;
+            }
+            _profile!.TimelineNative(snapshot.ToTimelineTotals());
+        }
+        catch (Exception exception)
+        {
+            System.Diagnostics.Debug.WriteLine("NVENC timeline snapshot failed: " + exception.Message);
+            _profile?.TimelineNativeUnavailable();
+        }
+    }
+
     // Must run before NvencDestroy. Diagnostics failures never prevent native cleanup.
     private void CaptureNativeProfile()
     {
@@ -211,6 +231,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
                 throw new InvalidOperationException("Native profiling snapshot unavailable.");
             }
             _profile.NativeReport = snapshot.ToReport();
+            _profile.TimelineFinalNative(snapshot.ToTimelineTotals());
             _profile.NativeStatus = "captured_before_destroy";
         }
         catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)

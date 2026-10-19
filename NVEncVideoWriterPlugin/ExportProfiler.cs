@@ -37,11 +37,14 @@ internal sealed class ExportProfiler
     private int _active, _maxActive;
     private long _videoFrames, _audioValues, _submittedFrames;
     private string? _failure;
+    private readonly TimelineRecorder _timeline;
 
     public ExportProfiler(bool discard, object configuration)
     {
         _discard = discard;
         _configuration = configuration;
+        _timeline = new TimelineRecorder(Stopwatch.Frequency,
+            TimelineRecorder.ParseBucketSec(Environment.GetEnvironmentVariable("NVENC_PROFILE_BUCKET_SEC")));
     }
 
     public object? NativeReport { get; set; }
@@ -62,7 +65,11 @@ internal sealed class ExportProfiler
             _firstCallback ??= now;
             if (_active++ == 0) _busyStart = now;
             _maxActive = Math.Max(_maxActive, _active);
-            if (stage is ExportStage.VideoCallback or ExportStage.CpuVideoCallback) _videoFrames++;
+            if (stage is ExportStage.VideoCallback or ExportStage.CpuVideoCallback)
+            {
+                _videoFrames++;
+                _timeline.VideoFrame(now);
+            }
             if (stage == ExportStage.AudioCallback) _audioValues += Math.Max(0, audioValues);
             return new Scope(this, stage, now, true);
         }
@@ -73,24 +80,51 @@ internal sealed class ExportProfiler
         lock (_gate)
         {
             var now = Stopwatch.GetTimestamp();
-            _metrics[(int)stage].Add(Math.Max(0, now - start));
+            var elapsed = Math.Max(0, now - start);
+            _metrics[(int)stage].Add(elapsed);
+            switch (stage)
+            {
+                case ExportStage.VideoCallback or ExportStage.CpuVideoCallback: _timeline.AddVideoCallback(elapsed); break;
+                case ExportStage.AudioCallback: _timeline.AddAudioCallback(elapsed); break;
+                case ExportStage.NativeVideo: _timeline.AddNativeVideo(elapsed); break;
+            }
             if (callback)
             {
                 _lastCallback = now;
-                if (--_active == 0) _busyTicks += Math.Max(0, now - _busyStart);
+                if (--_active == 0)
+                {
+                    var busy = Math.Max(0, now - _busyStart);
+                    _busyTicks += busy;
+                    _timeline.AddBusy(busy);
+                }
             }
         }
     }
 
     public void SubmittedVideo() { lock (_gate) _submittedFrames++; }
     public void Failed(Exception exception) { lock (_gate) _failure ??= exception.GetType().Name + ": " + exception.Message; }
-    public void Finish() { lock (_gate) _end = Stopwatch.GetTimestamp(); }
+    public void Finish()
+    {
+        lock (_gate)
+        {
+            _end = Stopwatch.GetTimestamp();
+            _timeline.Complete(_lastCallback != 0 ? _lastCallback : _end);
+        }
+    }
+
+    // True once a timeline bucket boundary was crossed; WriteVideo then takes one native snapshot.
+    public bool TimelineSnapshotWanted { get { lock (_gate) return _timeline.WantsNativeSnapshot; } }
+    public void TimelineNative(NativeTotals totals) { lock (_gate) _timeline.ApplyNative(totals); }
+    public void TimelineNativeUnavailable() { lock (_gate) _timeline.NativeUnavailable(); }
+    public void TimelineFinalNative(NativeTotals totals) { lock (_gate) _timeline.SetFinalNative(totals); }
 
     public object CreateReport()
     {
         lock (_gate)
         {
             var now = _end == 0 ? Stopwatch.GetTimestamp() : _end;
+            if (_end == 0) _timeline.Complete(_lastCallback != 0 ? _lastCallback : now);
+            var (timeline, timelineInfo, timelineSummary) = _timeline.BuildReport();
             double Ms(long ticks) => ticks * 1000d / _frequency;
             var lifetime = Ms(Math.Max(0, now - _created));
             var spanTicks = _firstCallback.HasValue ? Math.Max(0, _lastCallback - _firstCallback.Value) : 0;
@@ -127,6 +161,9 @@ internal sealed class ExportProfiler
                     max_concurrent_callbacks = _maxActive, active_callbacks_at_dispose = _active,
                 },
                 managed_stages = stages,
+                timeline_info = timelineInfo,
+                timeline_summary = timelineSummary,
+                timeline,
                 native_status = _discard ? "bypassed" : NativeStatus,
                 native = NativeReport,
                 notes = new[]
@@ -134,6 +171,8 @@ internal sealed class ExportProfiler
                     "CPU wall-time, not GPU timestamp measurements. Nested/asynchronous stage totals overlap; do not sum them.",
                     "Outside-callback time is not pure YMM4 rendering time. Work can overlap, and discarding changes GPU contention/backpressure.",
                     "received_fps is callback throughput including writer setup/finalization, not validated encoded-video fps.",
+                    "timeline: fixed wall-clock buckets from the first video frame callback. Per-bucket callback/native_video times are attributed to the bucket current when the call ended; outside_callbacks_ms = bucket wall time minus callback union (approximate).",
+                    "timeline native deltas (slot_wait_ms etc.) are snapshot differences taken at the first video frame after a bucket boundary and belong to the bucket that just closed; the last (partial) bucket also includes finalization drain. Absent in discard mode or when unavailable.",
                     "Report serialization/file I/O is excluded. Compare profiling off/on separately to assess measurement overhead.",
                 },
             };
