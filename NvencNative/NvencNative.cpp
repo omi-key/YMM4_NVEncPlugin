@@ -1732,12 +1732,38 @@ namespace
 
         uint8_t colorDescriptionPresent = 0;
         if (!reader.ReadBit(colorDescriptionPresent)) return false;
+        uint32_t colorPrimaries = 2, transferCharacteristics = 2, matrixCoefficients = 2; // unspecified
         if (colorDescriptionPresent)
         {
-            uint32_t ignored = 0;
-            if (!reader.ReadBits(ignored, 8)) return false;
-            if (!reader.ReadBits(ignored, 8)) return false;
-            if (!reader.ReadBits(ignored, 8)) return false;
+            if (!reader.ReadBits(colorPrimaries, 8)) return false;
+            if (!reader.ReadBits(transferCharacteristics, 8)) return false;
+            if (!reader.ReadBits(matrixCoefficients, 8)) return false;
+        }
+
+        if (monoChrome)
+        {
+            // color_range only; no chroma fields follow for monochrome.
+            uint8_t monoRange = 0;
+            if (!reader.ReadBit(monoRange)) return false;
+            info.highBitdepth = highBitdepth;
+            info.twelveBit = twelveBit;
+            info.monoChrome = 1;
+            info.subsamplingX = 1;
+            info.subsamplingY = 1;
+            info.chromaSamplePosition = 0;
+            return true;
+        }
+
+        if (colorPrimaries == 1 && transferCharacteristics == 13 && matrixCoefficients == 0)
+        {
+            // sRGB / identity matrix: full range 4:4:4, no further chroma fields.
+            info.highBitdepth = highBitdepth;
+            info.twelveBit = twelveBit;
+            info.monoChrome = 0;
+            info.subsamplingX = 0;
+            info.subsamplingY = 0;
+            info.chromaSamplePosition = 0;
+            return true;
         }
 
         uint8_t colorRange = 0;
@@ -1830,10 +1856,14 @@ namespace
             {
                 if (!ParseTimingInfo(reader)) return false;
             }
-            if (!reader.ReadBit(decoderModelInfoPresent)) return false;
-            if (decoderModelInfoPresent)
+            if (timingInfoPresent)
             {
-                if (!ParseDecoderModelInfo(reader, bufferDelayLengthMinus1)) return false;
+                // decoder_model_info_present_flag exists only when timing_info_present_flag is set.
+                if (!reader.ReadBit(decoderModelInfoPresent)) return false;
+                if (decoderModelInfoPresent)
+                {
+                    if (!ParseDecoderModelInfo(reader, bufferDelayLengthMinus1)) return false;
+                }
             }
             if (!reader.ReadBit(initialDisplayDelayPresent)) return false;
 
@@ -1934,7 +1964,8 @@ namespace
             }
             uint8_t seqChooseScreenContentTools = 0;
             if (!reader.ReadBit(seqChooseScreenContentTools)) return false;
-            uint8_t seqForceScreenContentTools = 0;
+            // SELECT_SCREEN_CONTENT_TOOLS (2) when the encoder leaves the choice to each frame.
+            uint8_t seqForceScreenContentTools = 2;
             if (!seqChooseScreenContentTools)
             {
                 if (!reader.ReadBit(seqForceScreenContentTools)) return false;
