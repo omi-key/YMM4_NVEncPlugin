@@ -7,6 +7,24 @@ NVENCのパイプライン化により非同期でのエンコードを行い、
 > 本バージョンから `IVideoFileWriter3` を実装するため、`IVideoFileWriter3` を持つ YMM4 が必要です。
 > それ以前の YMM4 では、「GPU直渡し」をOFFにしていてもプラグインを読み込めません。古い YMM4 を使う場合は更新前のバージョンをご利用ください。
 
+## このフォークについて
+
+これは [tarutaru247/YMM4_NVEncPlugin](https://github.com/tarutaru247/YMM4_NVEncPlugin)（v1.0, `c7cf161`）のフォークです。ライセンスは **MIT** で、上流の著作権表示を維持しています（[LICENSE](LICENSE)）。
+
+**Radeon (AMF) 版からの継承を含みます。** [disnana/YMM4_AMF_Plugin](https://github.com/disnana/YMM4_AMF_Plugin)（tp-li-dev / Disnana、MIT。こちら自体が上流の NVEnc プラグインから派生）で行われた次の改良のうち、ベンダーに依存しない部分や設計を、NVENC 向けに取り込んでいます。
+
+- 所有テクスチャのスロットプールと、専用の出力回収スレッド（AMF 版の設計を NVENC の API に合わせて書き直したもの）
+- MP4 の音声トラック長（tkhd）の修正、最初のエラーを保持する処理、入力検証、完了フレーム数の照合
+- プロファイリング JSON と「映像・音声を破棄」モード（`ExportProfiler` / `NvencProfiling.h` は AMF 版の `ExportProfiler` / `AmfProfiling.h` を翻案）
+- 出力検証スクリプト（`scripts/Validate-Output.ps1` と `scripts/Mp4Timing.Common.ps1`、`tests/Test-Mp4Timing.ps1` は AMF 版を翻案）
+- GPU 直渡し（`IVideoFileWriter3`）のオプション
+
+参照した AMF 版のコミットは `fb0da45`（v0.2.2）です。出典と各部品の扱いは [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt) にあります。
+
+このフォーク独自の変更には、AV1 のシーケンスヘッダ解析の修正、D3D11 マルチスレッド保護の有効化（出力スレッドとのデッドロック対策）、WSL2 から実 GPU で動かすネイティブのスモークテスト（`tests/native-smoke/`）があります。
+
+> **このフォークは未リリースです。** 下の「インストール」のリリースは上流のものです。動作確認は、RTX 4080 上の合成フレームによるネイティブ層のテストと、YMM4 4.56.1.0 Lite での 1080p60 H.264 出力までです。HEVC / AV1 の実プロジェクト出力、長時間運用、複数 GPU は未確認です。
+
 ## エンコード高速化
 品質を損なわずにエンコードを高速化します。  
 私の環境(RTX5070Ti/FullHD60fps)でエンコード速度を約2倍にすることに成功しています。  

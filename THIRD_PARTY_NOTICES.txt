@@ -4,6 +4,18 @@ Third-Party Notices
 This project uses or depends on the following third-party components.
 These components are NOT redistributed within this repository.
 
+0) YMM4_AMF_Plugin (source-derived portions)
+   - Source: https://github.com/disnana/YMM4_AMF_Plugin
+   - Reference commit: fb0da4515c0bfdecf4d50e136863f43163a34d7c (v0.2.2)
+   - License: MIT. Copyright (c) 2026 tarutaru247; Copyright (c) 2026 tp-li-dev / Disnana.
+     The copyright and full MIT permission notice are retained in the LICENSE file.
+   - Usage: Design and portions of code were adapted for NVENC: owned texture slot
+     pool / output-thread structure, MP4 audio-track duration fix, first-error-wins
+     error handling, ExportProfiler.cs and NvencProfiling.h (from AmfProfiling.h),
+     scripts/Validate-Output.ps1, scripts/Mp4Timing.Common.ps1, tests/Test-Mp4Timing.ps1,
+     and the IVideoFileWriter3 (GPU direct input) option.
+   - Note: That project is itself derived from the upstream YMM4_NVEncPlugin.
+
 1) NVIDIA NVENC SDK
    - Usage: NVENC API headers are required to build the native encoder module.
    - Distribution: Not included. Obtain the SDK from NVIDIA and follow its EULA.
@@ -11,3 +23,8 @@ These components are NOT redistributed within this repository.
 2) YukkuriMovieMaker v4 (YMM4)
    - Usage: This is a plugin for YMM4 and references YMM4 assemblies at build/runtime.
    - Distribution: Not included. Use and distribution must comply with YMM4's terms.
+
+3) nv-codec-headers (development/testing only)
+   - Source: https://github.com/FFmpeg/nv-codec-headers (MIT)
+   - Usage: tests/native-smoke/build-wsl.sh builds NvencNative.dll with mingw-w64 using
+     these NVENC API headers. They are NOT included in this repository.
