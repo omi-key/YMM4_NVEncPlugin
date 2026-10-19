@@ -12,6 +12,7 @@ internal sealed class NvencConfigView : UserControl
     private readonly ComboBox _texturePoolComboBox;
     private readonly CheckBox _hevcAsyncCheckBox;
     private readonly CheckBox _debugLogCheckBox;
+    private readonly CheckBox _gpuDirectCheckBox;
     private readonly NvencSettings _settings;
 
     public NvencConfigView(NvencSettings settings)
@@ -78,6 +79,19 @@ internal sealed class NvencConfigView : UserControl
         _debugLogCheckBox.Checked += (_, _) => _settings.EnableDebugLog = true;
         _debugLogCheckBox.Unchecked += (_, _) => _settings.EnableDebugLog = false;
         panel.Children.Add(_debugLogCheckBox);
+
+        _gpuDirectCheckBox = new CheckBox
+        {
+            Content = "GPU直渡し（実験・IVideoFileWriter3）",
+            IsChecked = _settings.EnableGpuDirectInput,
+            ToolTip = "ON: CPU 読み取り用ビットマップへの中間コピーを省き、描画済みの GPU フレームを直接受け取ります。"
+                + "プラグイン側の入力テクスチャプールへのコピーは維持します。速度向上は未検証です。"
+                + "設定は次に開始する出力に適用されます。",
+            Margin = new Thickness(0, 0, 0, 12),
+        };
+        _gpuDirectCheckBox.Checked += (_, _) => _settings.EnableGpuDirectInput = true;
+        _gpuDirectCheckBox.Unchecked += (_, _) => _settings.EnableGpuDirectInput = false;
+        panel.Children.Add(_gpuDirectCheckBox);
 
         panel.Children.Add(new TextBlock
         {

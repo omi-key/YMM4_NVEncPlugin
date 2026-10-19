@@ -8,12 +8,15 @@ using YukkuriMovieMaker.Project;
 
 namespace NVEncVideoWriterPlugin;
 
-internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
+internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
 {
     private readonly string _outputPath;
     private readonly VideoInfo _videoInfo;
     private readonly NvencSettings _settings;
     private readonly int _audioChannels;
+    // YMM4 queries this capability to choose the bitmap delivery path. Captured at
+    // construction so it stays constant for this export.
+    private readonly bool _gpuDirectInput;
     private IntPtr _encoderHandle = IntPtr.Zero;
     private bool _disposed;
     private readonly object _encodeLock = new();
@@ -23,10 +26,13 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
         _outputPath = outputPath;
         _videoInfo = videoInfo;
         _settings = settings;
+        _gpuDirectInput = settings.EnableGpuDirectInput;
         _audioChannels = ResolveAudioChannels(videoInfo);
     }
 
     public VideoFileWriterSupportedStreams SupportedStreams => VideoFileWriterSupportedStreams.Audio | VideoFileWriterSupportedStreams.Video;
+
+    public bool IsGpuFrameSupported => _gpuDirectInput;
 
     private readonly List<float> _pendingAudio = new();
 
@@ -52,7 +58,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
 
     public void WriteVideo(byte[] frame)
     {
-        // Not used in IVideoFileWriter2 mode.
+        // Not used in IVideoFileWriter2/3 mode.
     }
 
     public void WriteVideo(ID2D1Bitmap1 frame)

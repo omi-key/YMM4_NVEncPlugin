@@ -10,6 +10,8 @@ internal sealed class NvencSettings
     public bool EnableDebugLog { get; set; }
     // Input texture pool size (allowed: 4 / 6 / 8).
     public int TexturePoolSize { get; set; } = 6;
+    // Opt-in: advertise IVideoFileWriter3.IsGpuFrameSupported so YMM4 hands over GPU frames directly.
+    public bool EnableGpuDirectInput { get; set; }
 }
 
 internal enum NvencCodec
