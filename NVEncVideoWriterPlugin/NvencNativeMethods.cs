@@ -21,6 +21,27 @@ internal static class NvencNativeMethods
         int enableDebugLog,
         string outputPath);
 
+    [DllImport("NvencNative.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr NvencCreateWithPool(
+        IntPtr device,
+        int width,
+        int height,
+        int fps,
+        int bitrateKbps,
+        int codec,
+        int quality,
+        int fastPreset,
+        int rateControlMode,
+        int maxBitrateKbps,
+        int bufferFormat,
+        int hevcAsync,
+        int enableDebugLog,
+        string outputPath,
+        int texturePoolSize);
+
+    [DllImport("NvencNative.dll")]
+    public static extern int NvencGetPoolSize(IntPtr handle);
+
     [DllImport("NvencNative.dll")]
     public static extern int NvencEncode(IntPtr handle, IntPtr texture);
 

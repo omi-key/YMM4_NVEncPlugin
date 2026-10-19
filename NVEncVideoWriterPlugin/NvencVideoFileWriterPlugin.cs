@@ -33,6 +33,7 @@ public sealed class NvencVideoFileWriterPlugin : IVideoFileWriterPlugin
             RateControl = _settings.RateControl,
             HevcAsync = _settings.HevcAsync,
             EnableDebugLog = _settings.EnableDebugLog,
+            TexturePoolSize = _settings.TexturePoolSize,
         };
         return new NvencVideoFileWriter(path, videoInfo, snapshot);
     }

@@ -8,6 +8,8 @@ internal sealed class NvencSettings
     public NvencRateControl RateControl { get; set; } = NvencRateControl.YouTubeRecommended;
     public bool HevcAsync { get; set; } = true;
     public bool EnableDebugLog { get; set; }
+    // Input texture pool size (allowed: 4 / 6 / 8).
+    public int TexturePoolSize { get; set; } = 6;
 }
 
 internal enum NvencCodec

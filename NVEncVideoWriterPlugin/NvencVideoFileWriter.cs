@@ -153,7 +153,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
             : bitrate;
         var bufferFormat = ResolveBufferFormat(texture);
 
-        _encoderHandle = NvencNativeMethods.NvencCreate(
+        _encoderHandle = NvencNativeMethods.NvencCreateWithPool(
             device.NativePointer,
             _videoInfo.Width,
             _videoInfo.Height,
@@ -167,7 +167,8 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter2, IDisposable
             bufferFormat,
             _settings.HevcAsync && _settings.Codec == NvencCodec.H265 ? 1 : 0,
             _settings.EnableDebugLog ? 1 : 0,
-            _outputPath);
+            _outputPath,
+            _settings.TexturePoolSize);
 
         if (_encoderHandle == IntPtr.Zero)
         {

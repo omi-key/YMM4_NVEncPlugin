@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <thread>
 #include <atomic>
+#include <chrono>
 
 #include <mfapi.h>
 #include <mfidl.h>
@@ -185,11 +186,7 @@ namespace
         NV_ENC_INITIALIZE_PARAMS initParams{};
         NV_ENC_CONFIG config{};
         NV_ENC_OUTPUT_PTR bitstream = nullptr;
-        std::vector<NV_ENC_OUTPUT_PTR> asyncBitstreams;
-        std::vector<HANDLE> asyncEvents;
-        std::vector<bool> asyncPending;
         uint32_t asyncDepth = 0;
-        size_t asyncIndex = 0;
         bool asyncEnabled = false;
         NV_ENC_BUFFER_FORMAT bufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
         NV_ENC_BUFFER_FORMAT originalBufferFormat = NV_ENC_BUFFER_FORMAT_ARGB;
@@ -203,8 +200,35 @@ namespace
         ID3D11Texture2D* nv12Texture = nullptr;
         ID3D11VideoProcessorOutputView* vpOutputView = nullptr;
         NV_ENC_REGISTERED_PTR registeredNv12 = nullptr;
-        ID3D11Texture2D* rgbTexture = nullptr;
-        NV_ENC_REGISTERED_PTR registeredRgb = nullptr;
+        // Owned input-texture slot pool (RGB path, fastPreset == 0).
+        enum class SlotState { Free, Encoding, Completed };
+        struct InputSlot
+        {
+            ID3D11Texture2D* texture = nullptr;
+            NV_ENC_REGISTERED_PTR registered = nullptr;
+            NV_ENC_INPUT_PTR mapped = nullptr;      // null when not mapped
+            NV_ENC_OUTPUT_PTR bitstream = nullptr;
+            HANDLE completionEvent = nullptr;       // async mode only
+            bool eventRegistered = false;
+            SlotState state = SlotState::Free;      // guarded by slotMutex
+            uint64_t frameId = 0;
+        };
+        std::vector<InputSlot> slots;               // sized once at init, never resized afterwards
+        int poolSize = 6;
+        size_t nextSlot = 0;                        // render thread / slotMutex
+        bool poolReady = false;
+        std::mutex slotMutex;
+        std::condition_variable slotCv;
+        std::deque<size_t> submitQueue;             // submit-ordered FIFO, guarded by slotMutex
+        std::thread outputThread;
+        bool outputStarted = false;
+        std::atomic_bool outputStop = false;
+        std::atomic_bool outputError = false;
+        std::atomic_bool drainRequested = false;
+        std::mutex muxMutex;                        // video (output thread), audio and finalize
+        NV_ENC_OUTPUT_PTR eosBitstream = nullptr;
+        HANDLE eosEvent = nullptr;
+        bool eosEventRegistered = false;
         std::mutex fileMutex;
         std::mutex logMutex;
         std::mutex writerMutex;
@@ -276,17 +300,12 @@ namespace
     std::vector<uint8_t> BuildAacSpecificConfig(int sampleRate, int channels);
     bool InitializeMp4Writer(EncoderState* state, int codec, const std::vector<uint8_t>& codecPrivate);
     bool ProcessEncodedBitstream(EncoderState* state, const uint8_t* data, size_t size, NV_ENC_PIC_TYPE picType);
-    bool ConsumeAsyncBitstream(EncoderState* state, size_t index);
-    bool InitializeAsyncResources(EncoderState* state, uint32_t depth);
-    void ReleaseAsyncResources(EncoderState* state);
-    bool DrainAsyncBitstreams(EncoderState* state);
     void OpenLog(EncoderState* state);
     void CloseLog(EncoderState* state);
     void LogLine(EncoderState* state, const std::wstring& line);
     bool ProcessAudioOutput(EncoderState* state);
     bool EncodeAudioFrame(EncoderState* state, const int16_t* pcm, uint32_t frameSamplesPerChannel);
     bool FlushAudio(EncoderState* state);
-    bool EnsureRgbResource(EncoderState* state, ID3D11Texture2D* texture);
     bool EnsureVideoProcessor(EncoderState* state);
     ID3D11Texture2D* ConvertToNv12(EncoderState* state, ID3D11Texture2D* texture);
     void StartWriterThread(EncoderState* state);
@@ -2295,62 +2314,284 @@ namespace
         return true;
     }
 
-    bool ConsumeAsyncBitstream(EncoderState* state, size_t index)
+    // ------------------------------------------------------------------
+    // Owned input-texture slot pool + dedicated output thread.
+    //
+    // Threading contract (same as the AMF plugin):
+    //  * ID3D11DeviceContext::CopyResource and nvEncMapInputResource /
+    //    nvEncUnmapInputResource are called only from the WriteVideo (render)
+    //    thread (or from Finalize/Destroy after the output thread has joined).
+    //  * The output thread only waits on a slot's completion event, locks the
+    //    slot's bitstream, feeds the muxer under muxMutex, unlocks, and marks
+    //    the slot Completed. The render thread unmaps the input afterwards.
+    //  * Audio (NvencWriteAudio) and FinalizeMp4 take the same muxMutex.
+    // ------------------------------------------------------------------
+    constexpr int kTexturePoolDefault = 6;
+    constexpr int kTexturePoolMin = 4;
+    constexpr int kTexturePoolMax = 8;
+
+    int ResolveTexturePoolSize(int requested)
     {
-        if (!state || !state->asyncEnabled || index >= state->asyncBitstreams.size())
+        if (requested <= 0)
+        {
+            return kTexturePoolDefault;
+        }
+        return std::clamp(requested, kTexturePoolMin, kTexturePoolMax);
+    }
+
+    void UnmapSlotInput(EncoderState* state, EncoderState::InputSlot& slot)
+    {
+        if (slot.mapped && state->session)
+        {
+            state->funcs.nvEncUnmapInputResource(state->session, slot.mapped);
+        }
+        slot.mapped = nullptr;
+    }
+
+    void UnregisterAsyncEvent(EncoderState* state, HANDLE evt)
+    {
+        NV_ENC_EVENT_PARAMS eventParams{};
+        eventParams.version = NV_ENC_EVENT_PARAMS_VER;
+        eventParams.completionEvent = evt;
+        state->funcs.nvEncUnregisterAsyncEvent(state->session, &eventParams);
+    }
+
+    // Safe to call with a partially initialized pool and with a null session.
+    void ReleaseSlotPool(EncoderState* state)
+    {
+        if (!state)
+        {
+            return;
+        }
+
+        const bool haveSession = state->session != nullptr;
+        for (auto& slot : state->slots)
+        {
+            UnmapSlotInput(state, slot);
+            if (slot.registered)
+            {
+                if (haveSession)
+                {
+                    state->funcs.nvEncUnregisterResource(state->session, slot.registered);
+                }
+                slot.registered = nullptr;
+            }
+            if (slot.bitstream)
+            {
+                if (haveSession)
+                {
+                    state->funcs.nvEncDestroyBitstreamBuffer(state->session, slot.bitstream);
+                }
+                slot.bitstream = nullptr;
+            }
+            if (slot.completionEvent)
+            {
+                if (haveSession && slot.eventRegistered)
+                {
+                    UnregisterAsyncEvent(state, slot.completionEvent);
+                }
+                CloseHandle(slot.completionEvent);
+                slot.completionEvent = nullptr;
+                slot.eventRegistered = false;
+            }
+        }
+
+        if (state->eosBitstream)
+        {
+            if (haveSession)
+            {
+                state->funcs.nvEncDestroyBitstreamBuffer(state->session, state->eosBitstream);
+            }
+            state->eosBitstream = nullptr;
+        }
+        if (state->eosEvent)
+        {
+            if (haveSession && state->eosEventRegistered)
+            {
+                UnregisterAsyncEvent(state, state->eosEvent);
+            }
+            CloseHandle(state->eosEvent);
+            state->eosEvent = nullptr;
+            state->eosEventRegistered = false;
+        }
+
+        for (auto& slot : state->slots)
+        {
+            if (slot.texture)
+            {
+                slot.texture->Release();
+                slot.texture = nullptr;
+            }
+        }
+        state->slots.clear();
+        state->poolReady = false;
+    }
+
+    bool CreateRegisteredEvent(EncoderState* state, HANDLE& evt, bool& registered)
+    {
+        evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!evt)
+        {
+            SetError(state, L"Failed to create async event.");
+            return false;
+        }
+
+        NV_ENC_EVENT_PARAMS eventParams{};
+        eventParams.version = NV_ENC_EVENT_PARAMS_VER;
+        eventParams.completionEvent = evt;
+        auto status = state->funcs.nvEncRegisterAsyncEvent(state->session, &eventParams);
+        if (!CheckStatus(state, status, L"nvEncRegisterAsyncEvent failed"))
+        {
+            return false;
+        }
+        registered = true;
+        return true;
+    }
+
+    bool InitializeSlotPool(EncoderState* state, bool async)
+    {
+        if (!state || !state->session || !state->device || state->poolSize < 1)
         {
             return false;
         }
 
-        HANDLE eventHandle = state->asyncEvents[index];
-        if (eventHandle)
+        if (!state->deviceContext)
         {
-            DWORD result = WaitForSingleObject(eventHandle, 5000);
-            if (result == WAIT_OBJECT_0)
+            state->device->GetImmediateContext(&state->deviceContext);
+            if (!state->deviceContext)
             {
-                LogLine(state, L"async event signaled slot=" + std::to_wstring(index));
-            }
-            else if (result != WAIT_TIMEOUT)
-            {
-                SetError(state, L"nvEnc async wait failed.");
+                SetError(state, L"Failed to get D3D11 immediate context.");
                 return false;
-            }
-            else
-            {
-                LogLine(state, L"async wait timeout slot=" + std::to_wstring(index));
             }
         }
 
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(state->width);
+        desc.Height = static_cast<UINT>(state->height);
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = (state->bufferFormat == NV_ENC_BUFFER_FORMAT_ABGR) ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        desc.CPUAccessFlags = 0;
+        desc.MiscFlags = 0;
+
+        state->slots.assign(static_cast<size_t>(state->poolSize), EncoderState::InputSlot{});
+        for (size_t i = 0; i < state->slots.size(); ++i)
+        {
+            auto& slot = state->slots[i];
+            if (FAILED(state->device->CreateTexture2D(&desc, nullptr, &slot.texture)) || !slot.texture)
+            {
+                SetError(state, L"Failed to create NVENC input texture slot.");
+                ReleaseSlotPool(state);
+                return false;
+            }
+
+            NV_ENC_REGISTER_RESOURCE registerRes{};
+            registerRes.version = NV_ENC_REGISTER_RESOURCE_VER;
+            registerRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+            registerRes.resourceToRegister = slot.texture;
+            registerRes.width = state->width;
+            registerRes.height = state->height;
+            registerRes.bufferFormat = state->bufferFormat;
+            registerRes.bufferUsage = NV_ENC_INPUT_IMAGE;
+            auto status = state->funcs.nvEncRegisterResource(state->session, &registerRes);
+            if (!CheckStatus(state, status, L"nvEncRegisterResource failed"))
+            {
+                ReleaseSlotPool(state);
+                return false;
+            }
+            slot.registered = registerRes.registeredResource;
+
+            NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
+            createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+            status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
+            if (!CheckStatus(state, status, L"nvEncCreateBitstreamBuffer failed"))
+            {
+                ReleaseSlotPool(state);
+                return false;
+            }
+            slot.bitstream = createBitstream.bitstreamBuffer;
+
+            if (async && !CreateRegisteredEvent(state, slot.completionEvent, slot.eventRegistered))
+            {
+                ReleaseSlotPool(state);
+                return false;
+            }
+            slot.state = EncoderState::SlotState::Free;
+        }
+
+        // Dedicated EOS buffer (+ event in async mode) so no slot is borrowed at finalize.
+        NV_ENC_CREATE_BITSTREAM_BUFFER createEos{};
+        createEos.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+        auto eosStatus = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createEos);
+        if (!CheckStatus(state, eosStatus, L"nvEncCreateBitstreamBuffer (EOS) failed"))
+        {
+            ReleaseSlotPool(state);
+            return false;
+        }
+        state->eosBitstream = createEos.bitstreamBuffer;
+        if (async && !CreateRegisteredEvent(state, state->eosEvent, state->eosEventRegistered))
+        {
+            ReleaseSlotPool(state);
+            return false;
+        }
+
+        state->nextSlot = 0;
+        state->poolReady = true;
+        LogLine(state, L"texture pool initialized size=" + std::to_wstring(state->poolSize)
+            + L" async=" + std::to_wstring(async ? 1 : 0));
+        return true;
+    }
+
+    // Lock the bitstream, hand it to the muxer (under muxMutex), unlock.
+    // Used by the output thread (async), the render thread (sync) and finalize (EOS).
+    bool LockAndProcessBitstream(EncoderState* state, NV_ENC_OUTPUT_PTR bitstream, bool checkTimestamp, uint64_t expectedFrameId, bool isEos)
+    {
         const DWORD maxWaitMs = 5000;
         DWORD waited = 0;
-        LogLine(state, L"async lock start slot=" + std::to_wstring(index));
         while (waited < maxWaitMs)
         {
             NV_ENC_LOCK_BITSTREAM lockBitstream{};
             lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
-            lockBitstream.outputBitstream = state->asyncBitstreams[index];
-            lockBitstream.doNotWait = 1;
+            lockBitstream.outputBitstream = bitstream;
+            lockBitstream.doNotWait = 0;
             auto status = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
             if (status == NV_ENC_SUCCESS)
             {
-                LogLine(state, L"async bitstream lock ok slot=" + std::to_wstring(index));
                 bool ok = true;
-                if (lockBitstream.bitstreamSizeInBytes > 0)
+                if (checkTimestamp && lockBitstream.outputTimeStamp != expectedFrameId)
                 {
-                    ++state->completedFrames;
+                    SetError(state, L"NVENC output order mismatch (expected frame "
+                        + std::to_wstring(expectedFrameId) + L", got "
+                        + std::to_wstring(lockBitstream.outputTimeStamp) + L").");
+                    ok = false;
+                }
+                else if (lockBitstream.bitstreamSizeInBytes > 0)
+                {
+                    // An EOS packet normally carries no frame; count it only if a frame is still outstanding.
+                    if (!isEos || state->completedFrames < state->frameIndex)
+                    {
+                        ++state->completedFrames;
+                    }
+                    else
+                    {
+                        LogLine(state, L"EOS packet carried data beyond submitted frame count");
+                    }
+                    std::lock_guard<std::mutex> muxLock(state->muxMutex);
                     ok = ProcessEncodedBitstream(state,
                         static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
                         lockBitstream.bitstreamSizeInBytes,
                         lockBitstream.pictureType);
                 }
 
-                auto unlockStatus = state->funcs.nvEncUnlockBitstream(state->session, state->asyncBitstreams[index]);
+                auto unlockStatus = state->funcs.nvEncUnlockBitstream(state->session, bitstream);
                 if (!CheckStatus(state, unlockStatus, L"nvEncUnlockBitstream failed"))
                 {
                     return false;
                 }
-
-                state->asyncPending[index] = false;
                 return ok;
             }
             if (status != NV_ENC_ERR_LOCK_BUSY)
@@ -2363,148 +2604,196 @@ namespace
             waited += 2;
         }
 
-        LogLine(state, L"async lock timeout slot=" + std::to_wstring(index));
-        SetError(state, L"nvEnc async timeout.");
+        SetError(state, L"nvEnc lock bitstream timed out.");
         return false;
     }
 
-    bool InitializeAsyncResources(EncoderState* state, uint32_t depth)
+    // Waits for the completion event in short slices so a stop request is observed.
+    // Returns false on error/timeout (error set) or on stop request (no error set).
+    bool WaitForCompletionEvent(EncoderState* state, HANDLE evt, const wchar_t* context)
     {
-        if (!state || !state->session || depth < 2)
+        const DWORD sliceMs = 100;
+        const DWORD maxMs = 30000;
+        DWORD waited = 0;
+        for (;;)
         {
-            return false;
+            DWORD result = WaitForSingleObject(evt, sliceMs);
+            if (result == WAIT_OBJECT_0)
+            {
+                return true;
+            }
+            if (result != WAIT_TIMEOUT)
+            {
+                SetError(state, std::wstring(context) + L" wait failed.");
+                return false;
+            }
+            if (state->outputStop.load())
+            {
+                return false;
+            }
+            waited += sliceMs;
+            if (waited >= maxMs)
+            {
+                SetError(state, std::wstring(context) + L" timed out.");
+                return false;
+            }
         }
-
-        state->asyncBitstreams.clear();
-        state->asyncEvents.clear();
-        state->asyncPending.clear();
-        state->asyncBitstreams.resize(depth, nullptr);
-        state->asyncEvents.resize(depth, nullptr);
-        state->asyncPending.resize(depth, false);
-
-        for (uint32_t i = 0; i < depth; ++i)
-        {
-            NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
-            createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-            auto status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
-            if (!CheckStatus(state, status, L"nvEncCreateBitstreamBuffer failed"))
-            {
-                ReleaseAsyncResources(state);
-                return false;
-            }
-            state->asyncBitstreams[i] = createBitstream.bitstreamBuffer;
-
-            HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (!evt)
-            {
-                SetError(state, L"Failed to create async event.");
-                ReleaseAsyncResources(state);
-                return false;
-            }
-
-            NV_ENC_EVENT_PARAMS eventParams{};
-            eventParams.version = NV_ENC_EVENT_PARAMS_VER;
-            eventParams.completionEvent = evt;
-            status = state->funcs.nvEncRegisterAsyncEvent(state->session, &eventParams);
-            if (!CheckStatus(state, status, L"nvEncRegisterAsyncEvent failed"))
-            {
-                CloseHandle(evt);
-                ReleaseAsyncResources(state);
-                return false;
-            }
-
-            state->asyncEvents[i] = evt;
-        }
-
-        state->asyncDepth = depth;
-        state->asyncIndex = 0;
-        state->asyncEnabled = true;
-        LogLine(state, L"async initialized");
-        return true;
     }
 
-    void ReleaseAsyncResources(EncoderState* state)
+    void OutputThreadMain(EncoderState* state)
     {
-        if (!state)
+        LogLine(state, L"output thread started");
+        for (;;)
+        {
+            size_t index = 0;
+            {
+                std::unique_lock<std::mutex> lock(state->slotMutex);
+                state->slotCv.wait(lock, [state] { return state->outputStop.load() || !state->submitQueue.empty(); });
+                if (state->outputStop.load())
+                {
+                    break;
+                }
+                index = state->submitQueue.front();
+            }
+
+            // The slot stays at the front of the FIFO until it is fully consumed,
+            // so "FIFO empty" means "every submitted frame was muxed".
+            auto& slot = state->slots[index];
+            bool ok = WaitForCompletionEvent(state, slot.completionEvent, L"nvEnc async slot")
+                && LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+
+            std::lock_guard<std::mutex> lock(state->slotMutex);
+            if (!ok)
+            {
+                if (!state->outputStop.load() || HasError(state))
+                {
+                    if (!HasError(state))
+                    {
+                        SetError(state, L"NVENC output thread failed.");
+                    }
+                    state->outputError = true;
+                }
+                state->slotCv.notify_all();
+                break;
+            }
+            state->submitQueue.pop_front();
+            slot.state = EncoderState::SlotState::Completed;
+            state->slotCv.notify_all();
+        }
+        LogLine(state, L"output thread exiting");
+    }
+
+    void StartOutputThread(EncoderState* state)
+    {
+        if (!state || state->outputStarted)
         {
             return;
         }
-
-        for (size_t i = 0; i < state->asyncBitstreams.size(); ++i)
-        {
-            if (state->asyncBitstreams[i])
-            {
-                state->funcs.nvEncDestroyBitstreamBuffer(state->session, state->asyncBitstreams[i]);
-                state->asyncBitstreams[i] = nullptr;
-            }
-            if (state->asyncEvents[i])
-            {
-                NV_ENC_EVENT_PARAMS eventParams{};
-                eventParams.version = NV_ENC_EVENT_PARAMS_VER;
-                eventParams.completionEvent = state->asyncEvents[i];
-                state->funcs.nvEncUnregisterAsyncEvent(state->session, &eventParams);
-                CloseHandle(state->asyncEvents[i]);
-                state->asyncEvents[i] = nullptr;
-            }
-        }
-
-        state->asyncBitstreams.clear();
-        state->asyncEvents.clear();
-        state->asyncPending.clear();
-        state->asyncDepth = 0;
-        state->asyncIndex = 0;
-        state->asyncEnabled = false;
+        state->outputStop = false;
+        state->outputThread = std::thread(OutputThreadMain, state);
+        state->outputStarted = true;
     }
 
-    bool DrainAsyncBitstreams(EncoderState* state)
+    void StopOutputThread(EncoderState* state)
     {
-        if (!state || !state->asyncEnabled)
+        if (!state || !state->outputStarted)
         {
-            return true;
+            return;
         }
-
-        LogLine(state, L"drain async bitstreams");
-        const size_t depth = state->asyncPending.size();
-        const size_t start = depth > 0 ? state->asyncIndex % depth : 0;
-        for (size_t offset = 0; offset < depth; ++offset)
         {
-            const size_t i = (start + offset) % depth;
-            if (state->asyncPending[i])
-            {
-                LogLine(state, L"drain slot start=" + std::to_wstring(i));
-                if (!ConsumeAsyncBitstream(state, i))
-                {
-                    return false;
-                }
-                LogLine(state, L"drain slot done=" + std::to_wstring(i));
-            }
+            std::lock_guard<std::mutex> lock(state->slotMutex);
+            state->outputStop = true;
         }
-        state->asyncIndex = start;
-        return true;
+        state->slotCv.notify_all();
+        if (state->outputThread.joinable())
+        {
+            state->outputThread.join();
+        }
+        state->outputStarted = false;
     }
 
-    bool WaitForAsyncEvent(EncoderState* state, HANDLE eventHandle, const wchar_t* context)
+    // Render thread: wait for a Free/Completed slot (round-robin from nextSlot).
+    // A Completed slot still has its input mapped; unmap it here (render thread).
+    bool AcquireSlot(EncoderState* state, size_t& index)
     {
-        if (!eventHandle)
+        const size_t count = state->slots.size();
+        if (count == 0)
         {
-            return true;
-        }
-
-        LogLine(state, std::wstring(context) + L" start");
-        DWORD result = WaitForSingleObject(eventHandle, 5000);
-        if (result == WAIT_OBJECT_0)
-        {
-            LogLine(state, std::wstring(context) + L" done");
-            return true;
-        }
-        if (result == WAIT_TIMEOUT)
-        {
-            SetError(state, std::wstring(context) + L" timed out.");
+            SetError(state, L"NVENC input texture pool is unavailable.");
             return false;
         }
 
-        SetError(state, std::wstring(context) + L" failed.");
-        return false;
+        bool failed = false;
+        bool timedOut = false;
+        bool wasCompleted = false;
+        {
+            std::unique_lock<std::mutex> lock(state->slotMutex);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            for (;;)
+            {
+                if (state->outputError.load())
+                {
+                    failed = true;
+                    break;
+                }
+
+                bool found = false;
+                for (size_t n = 0; n < count; ++n)
+                {
+                    const size_t i = (state->nextSlot + n) % count;
+                    const auto st = state->slots[i].state;
+                    if (st == EncoderState::SlotState::Free || st == EncoderState::SlotState::Completed)
+                    {
+                        index = i;
+                        wasCompleted = (st == EncoderState::SlotState::Completed);
+                        found = true;
+                        break;
+                    }
+                }
+                if (found)
+                {
+                    state->slots[index].state = EncoderState::SlotState::Encoding;
+                    state->nextSlot = (index + 1) % count;
+                    break;
+                }
+
+                if (state->slotCv.wait_until(lock, deadline) == std::cv_status::timeout)
+                {
+                    timedOut = true;
+                    break;
+                }
+            }
+        }
+
+        if (failed)
+        {
+            if (!HasError(state))
+            {
+                SetError(state, L"NVENC output thread failed.");
+            }
+            return false;
+        }
+        if (timedOut)
+        {
+            SetError(state, L"Timed out waiting for a free NVENC input texture slot (30 s).");
+            return false;
+        }
+
+        if (wasCompleted)
+        {
+            UnmapSlotInput(state, state->slots[index]);
+        }
+        return true;
+    }
+
+    void FreeSlot(EncoderState* state, size_t index)
+    {
+        UnmapSlotInput(state, state->slots[index]);
+        {
+            std::lock_guard<std::mutex> lock(state->slotMutex);
+            state->slots[index].state = EncoderState::SlotState::Free;
+        }
+        state->slotCv.notify_all();
     }
 
     bool TryInitAv1CodecPrivate(EncoderState* state)
@@ -2660,7 +2949,9 @@ namespace
         state->initParams.enablePTD = 1;
         state->initParams.reportSliceOffsets = 0;
         state->initParams.enableSubFrameWrite = 0;
-        const bool allowAsync = (codec == kCodecH264) || (codec == kCodecAv1) || (codec == kCodecHevc && hevcAsyncOptIn);
+        // The legacy NV12 (fastPreset) path is synchronous; the pool path uses async when allowed.
+        const bool allowAsync = state->fastPreset == 0
+            && ((codec == kCodecH264) || (codec == kCodecAv1) || (codec == kCodecHevc && hevcAsyncOptIn));
         state->initParams.enableEncodeAsync = allowAsync ? 1 : 0;
         state->initParams.encodeConfig = &state->config;
 
@@ -2726,14 +3017,10 @@ namespace
             return false;
         }
 
-        if (!allowAsync)
+        state->asyncEnabled = false;
+        if (state->fastPreset != 0)
         {
-            state->initParams.enableEncodeAsync = 0;
-            state->asyncEnabled = false;
-            if (codec == kCodecHevc)
-            {
-                LogLine(state, L"HEVC async disabled (sync mode)");
-            }
+            // Legacy NV12 path: single synchronous bitstream buffer, no pool.
             NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
             createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
             status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
@@ -2742,37 +3029,28 @@ namespace
                 return false;
             }
             state->bitstream = createBitstream.bitstreamBuffer;
+            return true;
         }
-        else
-        {
-            uint32_t asyncDepth = 4;
-            if (state->config.rcParams.enableLookahead && state->config.rcParams.lookaheadDepth > 0)
-            {
-                asyncDepth = std::max<uint32_t>(asyncDepth, state->config.rcParams.lookaheadDepth + 2);
-            }
-            asyncDepth = std::min<uint32_t>(asyncDepth, 32);
-            LogLine(state, L"async depth=" + std::to_wstring(asyncDepth)
-                + L" lookahead=" + std::to_wstring(state->config.rcParams.enableLookahead)
-                + L" depth=" + std::to_wstring(state->config.rcParams.lookaheadDepth));
 
-            if (!InitializeAsyncResources(state, asyncDepth))
-            {
-                state->initParams.enableEncodeAsync = 0;
-                state->asyncEnabled = false;
-            if (codec == kCodecHevc)
-            {
-                LogLine(state, L"HEVC async failed, fallback to sync");
-            }
-                NV_ENC_CREATE_BITSTREAM_BUFFER createBitstream{};
-                createBitstream.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
-                status = state->funcs.nvEncCreateBitstreamBuffer(state->session, &createBitstream);
-                if (!CheckStatus(state, status, L"nvEncCreateBitstreamBuffer failed"))
-                {
-                    return false;
-                }
-                state->bitstream = createBitstream.bitstreamBuffer;
-            }
+        if (!allowAsync && codec == kCodecHevc)
+        {
+            LogLine(state, L"HEVC async disabled (sync mode)");
         }
+
+        // Pool size >= async depth: async depth == pool size (min 4).
+        state->poolSize = ResolveTexturePoolSize(state->poolSize);
+        state->asyncDepth = static_cast<uint32_t>(state->poolSize);
+        LogLine(state, L"texture pool size=" + std::to_wstring(state->poolSize)
+            + L" async=" + std::to_wstring(allowAsync ? 1 : 0)
+            + L" lookahead=" + std::to_wstring(state->config.rcParams.enableLookahead));
+
+        // The session was initialized with enableEncodeAsync matching allowAsync, so a
+        // failure here is fatal rather than silently switching modes.
+        if (!InitializeSlotPool(state, allowAsync))
+        {
+            return false;
+        }
+        state->asyncEnabled = allowAsync;
         return true;
     }
 
@@ -2804,6 +3082,153 @@ namespace
         return true;
     }
 
+    // Legacy NV12 (VideoProcessor) path: single texture, synchronous encode.
+    // Selected only when fastPreset != 0 (managed code passes 0). The encoder is
+    // initialized in sync mode for this path.
+    bool EncodeTextureNv12Sync(EncoderState* state, ID3D11Texture2D* texture)
+    {
+        auto* converted = ConvertToNv12(state, texture);
+        if (!converted)
+        {
+            SetError(state, L"NV12 conversion failed.");
+            return false;
+        }
+        texture = converted;
+
+        if (!state->registeredNv12)
+        {
+            NV_ENC_REGISTER_RESOURCE registerRes{};
+            registerRes.version = NV_ENC_REGISTER_RESOURCE_VER;
+            registerRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+            registerRes.resourceToRegister = texture;
+            registerRes.width = state->width;
+            registerRes.height = state->height;
+            registerRes.bufferFormat = state->bufferFormat;
+            registerRes.bufferUsage = NV_ENC_INPUT_IMAGE;
+            auto regStatus = state->funcs.nvEncRegisterResource(state->session, &registerRes);
+            if (!CheckStatus(state, regStatus, L"nvEncRegisterResource failed"))
+            {
+                return false;
+            }
+            state->registeredNv12 = registerRes.registeredResource;
+        }
+
+        NV_ENC_MAP_INPUT_RESOURCE map{};
+        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        map.registeredResource = state->registeredNv12;
+        auto status = state->funcs.nvEncMapInputResource(state->session, &map);
+        if (!CheckStatus(state, status, L"nvEncMapInputResource failed"))
+        {
+            return false;
+        }
+
+        const uint64_t frameId = state->frameIndex++;
+        NV_ENC_PIC_PARAMS pic{};
+        pic.version = NV_ENC_PIC_PARAMS_VER;
+        pic.inputBuffer = map.mappedResource;
+        pic.bufferFmt = state->bufferFormat;
+        pic.inputWidth = state->width;
+        pic.inputHeight = state->height;
+        pic.outputBitstream = state->bitstream;
+        pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+        pic.inputTimeStamp = frameId;
+        pic.inputDuration = 1;
+
+        status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        if (status == NV_ENC_ERR_NEED_MORE_INPUT)
+        {
+            state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
+            LogLine(state, L"encode needs more input");
+            return true;
+        }
+        if (!CheckStatus(state, status, L"nvEncEncodePicture failed"))
+        {
+            state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
+            return false;
+        }
+
+        bool ok = LockAndProcessBitstream(state, state->bitstream, true, frameId, false);
+        state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
+        return ok;
+    }
+
+    bool EncodeTexturePooled(EncoderState* state, ID3D11Texture2D* texture)
+    {
+        if (!state->poolReady || state->slots.empty() || !state->deviceContext)
+        {
+            SetError(state, L"NVENC input texture pool is unavailable.");
+            return false;
+        }
+
+        size_t index = 0;
+        if (!AcquireSlot(state, index))
+        {
+            return false;
+        }
+        auto& slot = state->slots[index];
+
+        state->deviceContext->CopyResource(slot.texture, texture);
+
+        NV_ENC_MAP_INPUT_RESOURCE map{};
+        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+        map.registeredResource = slot.registered;
+        auto status = state->funcs.nvEncMapInputResource(state->session, &map);
+        if (!CheckStatus(state, status, L"nvEncMapInputResource failed"))
+        {
+            FreeSlot(state, index);
+            return false;
+        }
+        slot.mapped = map.mappedResource;
+
+        slot.frameId = state->frameIndex++;
+        NV_ENC_PIC_PARAMS pic{};
+        pic.version = NV_ENC_PIC_PARAMS_VER;
+        pic.inputBuffer = slot.mapped;
+        pic.bufferFmt = state->bufferFormat;
+        pic.inputWidth = state->width;
+        pic.inputHeight = state->height;
+        pic.outputBitstream = slot.bitstream;
+        if (state->asyncEnabled)
+        {
+            pic.completionEvent = slot.completionEvent;
+        }
+        pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+        pic.inputTimeStamp = slot.frameId;
+        pic.inputDuration = 1;
+
+        status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        const bool needMoreInput = (status == NV_ENC_ERR_NEED_MORE_INPUT);
+        if (needMoreInput)
+        {
+            LogLine(state, L"encode needs more input");
+        }
+        else if (!CheckStatus(state, status, L"nvEncEncodePicture failed"))
+        {
+            FreeSlot(state, index);
+            return false;
+        }
+
+        if (state->asyncEnabled)
+        {
+            // Hand the slot to the output thread (FIFO preserves submit order).
+            {
+                std::lock_guard<std::mutex> lock(state->slotMutex);
+                state->submitQueue.push_back(index);
+            }
+            state->slotCv.notify_all();
+            return true;
+        }
+
+        // Sync fallback: consume inline, then unmap and free the slot.
+        bool ok = true;
+        if (!needMoreInput)
+        {
+            ok = LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+        }
+        FreeSlot(state, index);
+        return ok;
+    }
+
     bool EncodeTexture(EncoderState* state, ID3D11Texture2D* texture)
     {
         if (!state || !texture)
@@ -2816,223 +3241,11 @@ namespace
             return false;
         }
 
-        NV_ENC_REGISTERED_PTR registered = nullptr;
-        NV_ENC_BUFFER_FORMAT usedBufferFormat = state->bufferFormat;
         if (state->fastPreset != 0)
         {
-            auto* converted = ConvertToNv12(state, texture);
-            if (!converted)
-            {
-                // Fall back to RGB path when NV12 conversion is unavailable.
-                state->fastPreset = 0;
-                state->bufferFormat = state->originalBufferFormat;
-            }
-            else
-            {
-                texture = converted;
-
-                if (!state->registeredNv12)
-                {
-                    NV_ENC_REGISTER_RESOURCE registerRes{};
-                    registerRes.version = NV_ENC_REGISTER_RESOURCE_VER;
-                    registerRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-                    registerRes.resourceToRegister = texture;
-                    registerRes.width = state->width;
-                    registerRes.height = state->height;
-                    registerRes.bufferFormat = state->bufferFormat;
-                    registerRes.bufferUsage = NV_ENC_INPUT_IMAGE;
-                    auto status = state->funcs.nvEncRegisterResource(state->session, &registerRes);
-                    if (!CheckStatus(state, status, L"nvEncRegisterResource failed"))
-                    {
-                        return false;
-                    }
-                    state->registeredNv12 = registerRes.registeredResource;
-                }
-                registered = state->registeredNv12;
-                usedBufferFormat = state->bufferFormat;
-            }
+            return EncodeTextureNv12Sync(state, texture);
         }
-
-        if (!registered)
-        {
-            if (!EnsureRgbResource(state, texture))
-            {
-                SetError(state, L"Failed to prepare RGB input resource.");
-                return false;
-            }
-
-            state->deviceContext->CopyResource(state->rgbTexture, texture);
-            registered = state->registeredRgb;
-            usedBufferFormat = state->bufferFormat;
-        }
-
-        NV_ENC_MAP_INPUT_RESOURCE map{};
-        map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
-        map.registeredResource = registered;
-        auto status = state->funcs.nvEncMapInputResource(state->session, &map);
-        if (!CheckStatus(state, status, L"nvEncMapInputResource failed"))
-        {
-            return false;
-        }
-
-        NV_ENC_PIC_PARAMS pic{};
-        pic.version = NV_ENC_PIC_PARAMS_VER;
-        pic.inputBuffer = map.mappedResource;
-        pic.bufferFmt = usedBufferFormat;
-        pic.inputWidth = state->width;
-        pic.inputHeight = state->height;
-        size_t asyncSlot = 0;
-        if (state->asyncEnabled)
-        {
-            asyncSlot = state->asyncIndex % state->asyncBitstreams.size();
-            if (state->asyncPending[asyncSlot])
-            {
-                if (!ConsumeAsyncBitstream(state, asyncSlot))
-                {
-                    state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
-                    return false;
-                }
-            }
-            pic.outputBitstream = state->asyncBitstreams[asyncSlot];
-            pic.completionEvent = state->asyncEvents[asyncSlot];
-        }
-        else
-        {
-            pic.outputBitstream = state->bitstream;
-        }
-        pic.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-        pic.inputTimeStamp = state->frameIndex++;
-        pic.inputDuration = 1;
-
-        status = state->funcs.nvEncEncodePicture(state->session, &pic);
-        state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
-        if (status == NV_ENC_ERR_NEED_MORE_INPUT)
-        {
-            LogLine(state, L"encode needs more input");
-            return true;
-        }
-        if (!CheckStatus(state, status, L"nvEncEncodePicture failed"))
-        {
-            return false;
-        }
-
-        if (state->asyncEnabled)
-        {
-            state->asyncPending[asyncSlot] = true;
-            state->asyncIndex = (asyncSlot + 1) % state->asyncBitstreams.size();
-            return true;
-        }
-
-        NV_ENC_LOCK_BITSTREAM lockBitstream{};
-        lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
-        lockBitstream.outputBitstream = state->bitstream;
-        status = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
-        if (!CheckStatus(state, status, L"nvEncLockBitstream failed"))
-        {
-            return false;
-        }
-
-        if (lockBitstream.bitstreamSizeInBytes > 0)
-        {
-            ++state->completedFrames;
-        }
-        bool ok = ProcessEncodedBitstream(state,
-            static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
-            lockBitstream.bitstreamSizeInBytes,
-            lockBitstream.pictureType);
-
-        status = state->funcs.nvEncUnlockBitstream(state->session, state->bitstream);
-        if (!CheckStatus(state, status, L"nvEncUnlockBitstream failed"))
-        {
-            return false;
-        }
-
-        return ok;
-    }
-
-    bool EnsureRgbResource(EncoderState* state, ID3D11Texture2D* texture)
-    {
-        if (!state || !state->device || !texture)
-        {
-            return false;
-        }
-
-        if (!state->deviceContext)
-        {
-            state->device->GetImmediateContext(&state->deviceContext);
-            if (!state->deviceContext)
-            {
-                return false;
-            }
-        }
-
-        D3D11_TEXTURE2D_DESC srcDesc{};
-        texture->GetDesc(&srcDesc);
-
-        bool recreate = false;
-        if (!state->rgbTexture)
-        {
-            recreate = true;
-        }
-        else
-        {
-            D3D11_TEXTURE2D_DESC dstDesc{};
-            state->rgbTexture->GetDesc(&dstDesc);
-            if (dstDesc.Width != srcDesc.Width || dstDesc.Height != srcDesc.Height || dstDesc.Format != srcDesc.Format)
-            {
-                recreate = true;
-            }
-        }
-
-        if (recreate)
-        {
-            if (state->registeredRgb)
-            {
-                state->funcs.nvEncUnregisterResource(state->session, state->registeredRgb);
-                state->registeredRgb = nullptr;
-            }
-            if (state->rgbTexture)
-            {
-                state->rgbTexture->Release();
-                state->rgbTexture = nullptr;
-            }
-
-            D3D11_TEXTURE2D_DESC desc = srcDesc;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.SampleDesc.Count = 1;
-            desc.SampleDesc.Quality = 0;
-            desc.Usage = D3D11_USAGE_DEFAULT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            desc.CPUAccessFlags = 0;
-            desc.MiscFlags = 0;
-
-            if (FAILED(state->device->CreateTexture2D(&desc, nullptr, &state->rgbTexture)) || !state->rgbTexture)
-            {
-                return false;
-            }
-        }
-
-        if (!state->registeredRgb)
-        {
-            NV_ENC_REGISTER_RESOURCE registerRes{};
-            registerRes.version = NV_ENC_REGISTER_RESOURCE_VER;
-            registerRes.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
-            registerRes.resourceToRegister = state->rgbTexture;
-            registerRes.width = state->width;
-            registerRes.height = state->height;
-            registerRes.bufferFormat = state->bufferFormat;
-            registerRes.bufferUsage = NV_ENC_INPUT_IMAGE;
-
-            auto status = state->funcs.nvEncRegisterResource(state->session, &registerRes);
-            if (!CheckStatus(state, status, L"nvEncRegisterResource failed"))
-            {
-                return false;
-            }
-            state->registeredRgb = registerRes.registeredResource;
-        }
-
-        return true;
+        return EncodeTexturePooled(state, texture);
     }
 
     bool EnsureVideoProcessor(EncoderState* state)
@@ -3222,32 +3435,61 @@ namespace
     }
 }
 
+namespace
+{
+    void* CreateImpl(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality, int fastPreset, int rateControlMode, int maxBitrateKbps, int bufferFormat, int hevcAsync, int enableDebugLog, const wchar_t* outputPath, int texturePoolSize)
+    {
+        if (!device || !outputPath)
+        {
+            return nullptr;
+        }
+
+        auto* state = new EncoderState();
+        state->outputPath = outputPath;
+        state->logEnabled = enableDebugLog != 0;
+        state->poolSize = ResolveTexturePoolSize(texturePoolSize);
+        OpenLog(state);
+        LogLine(state, L"create encoder");
+
+        if (!InitializeEncoder(state, device, width, height, fps, bitrateKbps, codec, quality, fastPreset, rateControlMode, maxBitrateKbps, static_cast<NV_ENC_BUFFER_FORMAT>(bufferFormat), hevcAsync))
+        {
+            return state;
+        }
+
+        std::vector<uint8_t> empty;
+        if (!InitializeMp4Writer(state, codec, empty))
+        {
+            return state;
+        }
+
+        if (state->asyncEnabled)
+        {
+            StartOutputThread(state);
+        }
+
+        LogLine(state, L"encoder initialized");
+        return state;
+    }
+}
+
 void* NvencCreate(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality, int fastPreset, int rateControlMode, int maxBitrateKbps, int bufferFormat, int hevcAsync, int enableDebugLog, const wchar_t* outputPath)
 {
-    if (!device || !outputPath)
+    return CreateImpl(device, width, height, fps, bitrateKbps, codec, quality, fastPreset, rateControlMode, maxBitrateKbps, bufferFormat, hevcAsync, enableDebugLog, outputPath, kTexturePoolDefault);
+}
+
+void* NvencCreateWithPool(ID3D11Device* device, int width, int height, int fps, int bitrateKbps, int codec, int quality, int fastPreset, int rateControlMode, int maxBitrateKbps, int bufferFormat, int hevcAsync, int enableDebugLog, const wchar_t* outputPath, int texturePoolSize)
+{
+    return CreateImpl(device, width, height, fps, bitrateKbps, codec, quality, fastPreset, rateControlMode, maxBitrateKbps, bufferFormat, hevcAsync, enableDebugLog, outputPath, texturePoolSize);
+}
+
+int NvencGetPoolSize(void* handle)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !state->poolReady)
     {
-        return nullptr;
+        return 0;
     }
-
-    auto* state = new EncoderState();
-    state->outputPath = outputPath;
-    state->logEnabled = enableDebugLog != 0;
-    OpenLog(state);
-    LogLine(state, L"create encoder");
-
-    if (!InitializeEncoder(state, device, width, height, fps, bitrateKbps, codec, quality, fastPreset, rateControlMode, maxBitrateKbps, static_cast<NV_ENC_BUFFER_FORMAT>(bufferFormat), hevcAsync))
-    {
-        return state;
-    }
-
-    std::vector<uint8_t> empty;
-    if (!InitializeMp4Writer(state, codec, empty))
-    {
-        return state;
-    }
-
-    LogLine(state, L"encoder initialized");
-    return state;
+    return state->poolSize;
 }
 
 int NvencEncode(void* handle, ID3D11Texture2D* texture)
@@ -3274,6 +3516,8 @@ int NvencWriteAudio(void* handle, const float* samples, int sampleCount, int sam
         return 1;
     }
 
+    // Audio and video share the muxer/writer state; the output thread takes the same mutex.
+    std::lock_guard<std::mutex> muxLock(state->muxMutex);
     if (!InitializeAudioEncoder(state, sampleRate, channels))
     {
         return 0;
@@ -3317,55 +3561,124 @@ int NvencFinalize(void* handle)
     {
         return 0;
     }
+    if (!state->session)
+    {
+        if (!HasError(state))
+        {
+            SetError(state, L"NVENC encoder is not initialized.");
+        }
+        return 0;
+    }
 
+    state->drainRequested = true;
+
+    // 1. Submit EOS on the dedicated buffer (no slot is borrowed).
+    NV_ENC_OUTPUT_PTR eosBuffer = state->eosBitstream ? state->eosBitstream : state->bitstream;
     NV_ENC_PIC_PARAMS pic{};
     pic.version = NV_ENC_PIC_PARAMS_VER;
     pic.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+    pic.outputBitstream = eosBuffer;
     if (state->asyncEnabled)
     {
-        if (state->asyncBitstreams.empty())
+        pic.completionEvent = state->eosEvent;
+    }
+    auto status = state->funcs.nvEncEncodePicture(state->session, &pic);
+    if (status != NV_ENC_SUCCESS)
+    {
+        SetError(state, L"nvEncEncodePicture (EOS) failed");
+        return 0;
+    }
+    LogLine(state, state->asyncEnabled ? L"encode EOS submitted (async)" : L"encode EOS submitted");
+
+    bool ok = true;
+    if (state->asyncEnabled)
+    {
+        // The EOS event fires after all earlier pictures; wait for it, then for the FIFO to drain.
+        if (!WaitForCompletionEvent(state, state->eosEvent, L"nvEnc async EOS"))
         {
-            SetError(state, L"NVENC async resources are unavailable.");
-            return 0;
+            ok = false;
         }
 
-        const size_t asyncSlot = state->asyncIndex % state->asyncBitstreams.size();
-        if (state->asyncPending[asyncSlot] && !ConsumeAsyncBitstream(state, asyncSlot))
+        // 2. Wait for the output thread to consume every submitted slot (60 s deadline).
         {
-            return 0;
-        }
-
-        pic.outputBitstream = state->asyncBitstreams[asyncSlot];
-        pic.completionEvent = state->asyncEvents[asyncSlot];
-        auto status = state->funcs.nvEncEncodePicture(state->session, &pic);
-        if (status != NV_ENC_SUCCESS)
-        {
-            SetError(state, L"nvEncEncodePicture (EOS) failed");
-            return 0;
-        }
-
-        state->asyncIndex = (asyncSlot + 1) % state->asyncBitstreams.size();
-        LogLine(state, L"encode EOS submitted (async)");
-        state->asyncPending[asyncSlot] = false;
-        if (!WaitForAsyncEvent(state, state->asyncEvents[asyncSlot], L"nvEnc async EOS wait"))
-        {
-            return 0;
-        }
-        if (!DrainAsyncBitstreams(state))
-        {
-            return 0;
+            std::unique_lock<std::mutex> lock(state->slotMutex);
+            const bool drained = state->slotCv.wait_for(lock, std::chrono::seconds(60), [state] {
+                return state->submitQueue.empty() || state->outputError.load();
+            });
+            if (!drained)
+            {
+                lock.unlock();
+                SetError(state, L"Timed out waiting for NVENC output to drain (60 s).");
+                ok = false;
+            }
         }
     }
-    else
+
+    // 3. Output thread is no longer needed; join it.
+    StopOutputThread(state);
+
+    // 4. Now safe to unmap inputs still held by Completed slots (output thread has joined).
+    for (auto& slot : state->slots)
     {
-        pic.outputBitstream = state->bitstream;
-        auto status = state->funcs.nvEncEncodePicture(state->session, &pic);
-        if (status != NV_ENC_SUCCESS)
+        UnmapSlotInput(state, slot);
+        if (slot.state == EncoderState::SlotState::Completed)
         {
-            SetError(state, L"nvEncEncodePicture (EOS) failed");
-            return 0;
+            slot.state = EncoderState::SlotState::Free;
         }
-        LogLine(state, L"encode EOS submitted");
+    }
+
+    if (state->outputError.load() || !ok || HasError(state))
+    {
+        if (!HasError(state))
+        {
+            SetError(state, L"NVENC finalize failed.");
+        }
+        return 0;
+    }
+
+    // EOS packet normally carries no data; a lock failure here is logged, and the
+    // completed==submitted check below is the authoritative guard.
+    if (state->eosBitstream || !state->asyncEnabled)
+    {
+        NV_ENC_OUTPUT_PTR buf = eosBuffer;
+        if (buf)
+        {
+            NV_ENC_LOCK_BITSTREAM lockBitstream{};
+            lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
+            lockBitstream.outputBitstream = buf;
+            auto lockStatus = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
+            if (lockStatus == NV_ENC_SUCCESS)
+            {
+                if (lockBitstream.bitstreamSizeInBytes > 0)
+                {
+                    if (state->completedFrames < state->frameIndex)
+                    {
+                        ++state->completedFrames;
+                    }
+                    else
+                    {
+                        LogLine(state, L"EOS packet carried data beyond submitted frame count");
+                    }
+                    std::lock_guard<std::mutex> muxLock(state->muxMutex);
+                    if (!ProcessEncodedBitstream(state,
+                        static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
+                        lockBitstream.bitstreamSizeInBytes,
+                        lockBitstream.pictureType))
+                    {
+                        ok = false;
+                    }
+                }
+                state->funcs.nvEncUnlockBitstream(state->session, buf);
+            }
+            else
+            {
+                LogLine(state, L"EOS bitstream lock failed status=" + std::to_wstring(static_cast<int>(lockStatus)));
+            }
+        }
+    }
+    if (!ok || HasError(state))
+    {
+        return 0;
     }
 
     LogLine(state, L"nvenc finalize frames submitted=" + std::to_wstring(state->frameIndex)
@@ -3376,12 +3689,12 @@ int NvencFinalize(void* handle)
         return 0;
     }
 
-    if (!FinalizeMp4(state))
+    bool finalized = false;
     {
-        return 0;
+        std::lock_guard<std::mutex> muxLock(state->muxMutex);
+        finalized = FinalizeMp4(state);
     }
-
-    return 1;
+    return finalized ? 1 : 0;
 }
 
 void NvencDestroy(void* handle)
@@ -3393,20 +3706,41 @@ void NvencDestroy(void* handle)
     }
 
     LogLine(state, L"destroy");
+
+    // Give in-flight frames a short chance to drain (cancel without Finalize), then stop the
+    // output thread FIRST so nothing touches the session while resources are torn down.
+    if (state->outputStarted && !state->outputError.load())
+    {
+        std::unique_lock<std::mutex> lock(state->slotMutex);
+        state->slotCv.wait_for(lock, std::chrono::seconds(5), [state] {
+            return state->submitQueue.empty() || state->outputError.load();
+        });
+    }
+    StopOutputThread(state);
+
+    bool drained = false;
+    {
+        std::lock_guard<std::mutex> lock(state->slotMutex);
+        drained = state->submitQueue.empty() && !state->outputError.load();
+    }
     if (!state->mp4Finalized)
     {
-        DrainAsyncBitstreams(state);
-        FinalizeMp4(state);
+        if (drained)
+        {
+            std::lock_guard<std::mutex> muxLock(state->muxMutex);
+            FinalizeMp4(state);
+        }
+        else
+        {
+            LogLine(state, L"destroy: output not drained, skipping FinalizeMp4");
+        }
     }
+
+    // Unmap inputs, unregister resources, destroy bitstreams/events/EOS buffer, release slot textures.
+    ReleaseSlotPool(state);
 
     if (state->session)
     {
-        ReleaseAsyncResources(state);
-        if (state->registeredRgb)
-        {
-            state->funcs.nvEncUnregisterResource(state->session, state->registeredRgb);
-            state->registeredRgb = nullptr;
-        }
         if (state->registeredNv12)
         {
             state->funcs.nvEncUnregisterResource(state->session, state->registeredNv12);
@@ -3449,11 +3783,6 @@ void NvencDestroy(void* handle)
     {
         state->vpOutputView->Release();
         state->vpOutputView = nullptr;
-    }
-    if (state->rgbTexture)
-    {
-        state->rgbTexture->Release();
-        state->rgbTexture = nullptr;
     }
     if (state->nv12Texture)
     {

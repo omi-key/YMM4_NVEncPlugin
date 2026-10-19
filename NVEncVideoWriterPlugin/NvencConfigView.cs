@@ -9,6 +9,7 @@ internal sealed class NvencConfigView : UserControl
     private readonly ComboBox _rateControlComboBox;
     private readonly TextBox _bitrateTextBox;
     private readonly ComboBox _qualityComboBox;
+    private readonly ComboBox _texturePoolComboBox;
     private readonly CheckBox _hevcAsyncCheckBox;
     private readonly CheckBox _debugLogCheckBox;
     private readonly NvencSettings _settings;
@@ -114,6 +115,38 @@ internal sealed class NvencConfigView : UserControl
             _settings.Quality = (NvencQuality)Math.Clamp(_qualityComboBox.SelectedIndex, 0, 2);
         };
         panel.Children.Add(_qualityComboBox);
+
+        const string texturePoolTip = "NVENC に渡す入力テクスチャ（GPU メモリ上のフレームバッファ）の枚数です。"
+            + "大きいほどエンコード待ちを吸収しやすくなりますが、その分 GPU メモリを多く消費します。";
+        panel.Children.Add(new TextBlock
+        {
+            Text = "入力テクスチャプール",
+            Margin = new Thickness(0, 0, 0, 4),
+            ToolTip = texturePoolTip,
+        });
+
+        _texturePoolComboBox = new ComboBox
+        {
+            Margin = new Thickness(0, 0, 0, 12),
+            ItemsSource = new[] { "4", "6（標準）", "8" },
+            ToolTip = texturePoolTip,
+            SelectedIndex = _settings.TexturePoolSize switch
+            {
+                4 => 0,
+                8 => 2,
+                _ => 1,
+            },
+        };
+        _texturePoolComboBox.SelectionChanged += (_, _) =>
+        {
+            _settings.TexturePoolSize = _texturePoolComboBox.SelectedIndex switch
+            {
+                0 => 4,
+                2 => 8,
+                _ => 6,
+            };
+        };
+        panel.Children.Add(_texturePoolComboBox);
 
         panel.Children.Add(new TextBlock
         {
