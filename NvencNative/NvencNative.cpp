@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
+#include <d3d10.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -2873,6 +2874,21 @@ namespace
         if (state->device)
         {
             state->device->AddRef();
+
+            // The output thread calls nvEncLockBitstream, which re-enters the D3D11 device
+            // inside the NVIDIA user-mode driver, while the render thread keeps issuing
+            // immediate-context calls (CopyResource, caller's own rendering). Without
+            // runtime-level serialization the two can deadlock inside nvwgf2umx.dll
+            // (observed on RTX 4080 / driver 610.88: render thread stuck in Flush and the
+            // output thread stuck in LockBitstream, ~1 in 15 runs). Protecting the device
+            // makes the D3D11 runtime take its device lock around every call. It is
+            // idempotent and a no-op if the host already enabled it.
+            ID3D10Multithread* multithread = nullptr;
+            if (SUCCEEDED(state->device->QueryInterface(__uuidof(ID3D10Multithread), reinterpret_cast<void**>(&multithread))) && multithread)
+            {
+                multithread->SetMultithreadProtected(TRUE);
+                multithread->Release();
+            }
         }
 
         const bool hevcAsyncOptIn = (codec == kCodecHevc && hevcAsync != 0);
