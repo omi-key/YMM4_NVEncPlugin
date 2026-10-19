@@ -12,6 +12,9 @@ internal sealed class NvencSettings
     public int TexturePoolSize { get; set; } = 6;
     // Opt-in: advertise IVideoFileWriter3.IsGpuFrameSupported so YMM4 hands over GPU frames directly.
     public bool EnableGpuDirectInput { get; set; }
+    // Diagnostics (both default off): write an aggregate timing JSON / discard video and audio without encoding.
+    public bool EnableProfiling { get; set; }
+    public bool DiscardOutput { get; set; }
 }
 
 internal enum NvencCodec

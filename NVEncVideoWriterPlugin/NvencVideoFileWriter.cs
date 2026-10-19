@@ -20,6 +20,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
     private IntPtr _encoderHandle = IntPtr.Zero;
     private bool _disposed;
     private readonly object _encodeLock = new();
+    private readonly ExportProfiler? _profile;
 
     public NvencVideoFileWriter(string outputPath, VideoInfo videoInfo, NvencSettings settings)
     {
@@ -28,6 +29,24 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
         _settings = settings;
         _gpuDirectInput = settings.EnableGpuDirectInput;
         _audioChannels = ResolveAudioChannels(videoInfo);
+        if (settings.EnableProfiling)
+        {
+            _profile = new ExportProfiler(settings.DiscardOutput, new
+            {
+                plugin_version = typeof(NvencVideoFileWriter).Assembly.GetName().Version?.ToString(),
+                assembly_mvid = typeof(NvencVideoFileWriter).Assembly.ManifestModule.ModuleVersionId,
+                os = Environment.OSVersion.VersionString,
+                dotnet = RuntimeInformation.FrameworkDescription,
+                width = videoInfo.Width, height = videoInfo.Height, fps = videoInfo.FPS,
+                sample_rate = videoInfo.Hz, audio_channels = _audioChannels,
+                codec = settings.Codec.ToString(), quality = settings.Quality.ToString(),
+                rate_control = settings.RateControl.ToString(), target_bitrate_kbps = GetTargetBitrateKbps(),
+                requested_pool_size = settings.TexturePoolSize,
+                hevc_async = settings.HevcAsync && settings.Codec == NvencCodec.H265,
+                debug_log_enabled = settings.EnableDebugLog,
+                gpu_direct_input_enabled = _gpuDirectInput,
+            });
+        }
     }
 
     public VideoFileWriterSupportedStreams SupportedStreams => VideoFileWriterSupportedStreams.Audio | VideoFileWriterSupportedStreams.Video;
@@ -39,57 +58,88 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
     public void WriteAudio(float[] samples)
     {
         EnsureNotDisposed();
-        if (samples == null || samples.Length == 0)
+        using var callback = _profile?.Callback(ExportStage.AudioCallback, samples?.Length ?? 0) ?? default;
+        try
         {
-            return;
-        }
-
-        lock (_encodeLock)
-        {
-            if (_encoderHandle == IntPtr.Zero)
+            // Diagnostic sink: no buffering, conversion, native call, or file creation.
+            if (_settings.DiscardOutput || samples == null || samples.Length == 0)
             {
-                _pendingAudio.AddRange(samples);
                 return;
             }
 
-            WriteAudioInternal(samples);
+            var wait = _profile?.Measure(ExportStage.AudioLockWait) ?? default;
+            lock (_encodeLock)
+            {
+                wait.Dispose();
+                if (_encoderHandle == IntPtr.Zero)
+                {
+                    _pendingAudio.AddRange(samples);
+                    return;
+                }
+
+                WriteAudioInternal(samples);
+            }
         }
+        catch (Exception exception) { _profile?.Failed(exception); throw; }
     }
 
     public void WriteVideo(byte[] frame)
     {
-        // Not used in IVideoFileWriter2/3 mode.
+        // Not used in IVideoFileWriter2/3 mode. The diagnostic sink also accepts this overload.
+        EnsureNotDisposed();
+        using var callback = _profile?.Callback(ExportStage.CpuVideoCallback) ?? default;
     }
 
     public void WriteVideo(ID2D1Bitmap1 frame)
     {
         EnsureNotDisposed();
-
-        if (_videoInfo.HasErrors || _videoInfo.Width <= 0 || _videoInfo.Height <= 0)
+        if (_profile is not null)
         {
-            return;
+            _profile.InputDeliveryPath = IsGpuFrameSupported ? "gpu_direct_IVideoFileWriter3" : "cpu_read_bitmap_IVideoFileWriter2";
         }
-
-        using var surface = frame.Surface;
-        using var texture = surface.QueryInterface<ID3D11Texture2D>();
-        if (texture is null)
+        using var callback = _profile?.Callback(ExportStage.VideoCallback) ?? default;
+        try
         {
-            throw new InvalidOperationException("D3D11 テクスチャを取得できませんでした。");
-        }
-
-        lock (_encodeLock)
-        {
-            if (_encoderHandle == IntPtr.Zero)
+            // Return before even querying Surface: do not retain or copy the host's texture.
+            if (_settings.DiscardOutput)
             {
-                InitializeEncoder(texture);
+                return;
             }
 
-            var result = NvencNativeMethods.NvencEncode(_encoderHandle, texture.NativePointer);
-            if (result == 0)
+            if (_videoInfo.HasErrors || _videoInfo.Width <= 0 || _videoInfo.Height <= 0)
             {
-                throw new InvalidOperationException(GetNativeError());
+                return;
+            }
+
+            var textureAccess = _profile?.Measure(ExportStage.TextureAccess) ?? default;
+            using var surface = frame.Surface;
+            using var texture = surface.QueryInterface<ID3D11Texture2D>();
+            textureAccess.Dispose();
+            if (texture is null)
+            {
+                throw new InvalidOperationException("D3D11 テクスチャを取得できませんでした。");
+            }
+
+            var wait = _profile?.Measure(ExportStage.VideoLockWait) ?? default;
+            lock (_encodeLock)
+            {
+                wait.Dispose();
+                if (_encoderHandle == IntPtr.Zero)
+                {
+                    using var initialize = _profile?.Measure(ExportStage.EncoderInitialize) ?? default;
+                    InitializeEncoder(texture);
+                }
+
+                using var native = _profile?.Measure(ExportStage.NativeVideo) ?? default;
+                var result = NvencNativeMethods.NvencEncode(_encoderHandle, texture.NativePointer);
+                if (result == 0)
+                {
+                    throw new InvalidOperationException(GetNativeError());
+                }
+                _profile?.SubmittedVideo();
             }
         }
+        catch (Exception exception) { _profile?.Failed(exception); throw; }
     }
 
     public void Dispose()
@@ -100,30 +150,72 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
         }
 
         _disposed = true;
-
-        lock (_encodeLock)
+        var disposeScope = _profile?.Measure(ExportStage.Dispose) ?? default;
+        try
         {
-            if (_encoderHandle != IntPtr.Zero)
+            lock (_encodeLock)
             {
-                var finalizeResult = 0;
-                var finalizeError = string.Empty;
-                try
+                if (_encoderHandle != IntPtr.Zero)
                 {
-                    finalizeResult = NvencNativeMethods.NvencFinalize(_encoderHandle);
-                    finalizeError = finalizeResult == 0 ? GetNativeError() : string.Empty;
-                }
-                finally
-                {
-                    NvencNativeMethods.NvencDestroy(_encoderHandle);
-                    _encoderHandle = IntPtr.Zero;
-                }
-                if (finalizeResult == 0)
-                {
-                    throw new InvalidOperationException(string.IsNullOrWhiteSpace(finalizeError)
-                        ? "NVENC 出力の終了処理に失敗しました。"
-                        : finalizeError);
+                    var finalizeResult = 0;
+                    var finalizeError = string.Empty;
+                    try
+                    {
+                        using var finalize = _profile?.Measure(ExportStage.NativeFinalize) ?? default;
+                        finalizeResult = NvencNativeMethods.NvencFinalize(_encoderHandle);
+                        finalizeError = finalizeResult == 0 ? GetNativeError() : string.Empty;
+                        if (_profile is not null)
+                        {
+                            _profile.OutputFinalized = finalizeResult != 0;
+                        }
+                    }
+                    finally
+                    {
+                        CaptureNativeProfile();
+                        using var destroy = _profile?.Measure(ExportStage.NativeDestroy) ?? default;
+                        NvencNativeMethods.NvencDestroy(_encoderHandle);
+                        _encoderHandle = IntPtr.Zero;
+                    }
+                    if (finalizeResult == 0)
+                    {
+                        throw new InvalidOperationException(string.IsNullOrWhiteSpace(finalizeError)
+                            ? "NVENC 出力の終了処理に失敗しました。"
+                            : finalizeError);
+                    }
                 }
             }
+        }
+        catch (Exception exception) { _profile?.Failed(exception); throw; }
+        finally
+        {
+            disposeScope.Dispose();
+            _profile?.Finish();
+            // Save only throws when no earlier failure was recorded, so it never masks the original exception.
+            _profile?.Save(_outputPath);
+        }
+    }
+
+    // Must run before NvencDestroy. Diagnostics failures never prevent native cleanup.
+    private void CaptureNativeProfile()
+    {
+        if (_profile is null || _encoderHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        try
+        {
+            _profile.EffectivePoolSize = NvencNativeMethods.NvencGetPoolSize(_encoderHandle);
+            if (NvencNativeMethods.NvencGetProfile(_encoderHandle, out var snapshot, (uint)Marshal.SizeOf<NativeProfileSnapshot>()) == 0)
+            {
+                throw new InvalidOperationException("Native profiling snapshot unavailable.");
+            }
+            _profile.NativeReport = snapshot.ToReport();
+            _profile.NativeStatus = "captured_before_destroy";
+        }
+        catch (Exception exception) when (exception is EntryPointNotFoundException or InvalidOperationException)
+        {
+            _profile.NativeStatus = "unavailable: " + exception.Message;
         }
     }
 
@@ -189,6 +281,31 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
             throw new InvalidOperationException(error);
         }
 
+        if (_profile is not null)
+        {
+            try
+            {
+                if (NvencNativeMethods.NvencEnableProfiling(_encoderHandle) == 0)
+                {
+                    throw new InvalidOperationException("NVENCプロファイリングを開始できませんでした。");
+                }
+                _profile.NativeStatus = "enabled";
+            }
+            catch (Exception exception)
+            {
+                // No frame was submitted. Clean up now so a later Dispose cannot replace this
+                // initialization error with a secondary error.
+                NvencNativeMethods.NvencDestroy(_encoderHandle);
+                _encoderHandle = IntPtr.Zero;
+                _profile.NativeStatus = "initialization_failed";
+                if (exception is EntryPointNotFoundException)
+                {
+                    throw new InvalidOperationException("NvencNative.dllが古いため計測できません。NVEncPlugin.dllと同じビルドのDLLを配置してください。", exception);
+                }
+                throw;
+            }
+        }
+
         if (_pendingAudio.Count > 0)
         {
             var buffer = _pendingAudio.ToArray();
@@ -200,6 +317,7 @@ internal sealed class NvencVideoFileWriter : IVideoFileWriter3, IDisposable
     private void WriteAudioInternal(float[] samples)
     {
         var sampleRate = Math.Max(8000, _videoInfo.Hz);
+        using var native = _profile?.Measure(ExportStage.NativeAudio) ?? default;
         var result = NvencNativeMethods.NvencWriteAudio(_encoderHandle, samples, samples.Length, sampleRate, _audioChannels);
         if (result == 0)
         {

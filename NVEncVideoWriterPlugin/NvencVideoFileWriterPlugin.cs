@@ -35,6 +35,8 @@ public sealed class NvencVideoFileWriterPlugin : IVideoFileWriterPlugin
             EnableDebugLog = _settings.EnableDebugLog,
             TexturePoolSize = _settings.TexturePoolSize,
             EnableGpuDirectInput = _settings.EnableGpuDirectInput,
+            DiscardOutput = _settings.DiscardOutput,
+            EnableProfiling = _settings.EnableProfiling,
         };
         return new NvencVideoFileWriter(path, videoInfo, snapshot);
     }

@@ -1,4 +1,5 @@
 #include "NvencNative.h"
+#include "NvencProfiling.h"
 
 #define NOMINMAX
 #include <windows.h>
@@ -212,6 +213,7 @@ namespace
             bool eventRegistered = false;
             SlotState state = SlotState::Free;      // guarded by slotMutex
             uint64_t frameId = 0;
+            uint64_t acquiredNs = 0;                // profiling only; 0 when disabled
         };
         std::vector<InputSlot> slots;               // sized once at init, never resized afterwards
         int poolSize = 6;
@@ -278,6 +280,7 @@ namespace
         std::wstring outputPath;
         std::wstring lastError;
         std::mutex errorMutex;
+        NvencProfiler profile;
         uint64_t completedFrames = 0;
         bool logEnabled = false;
         HANDLE logFile = INVALID_HANDLE_VALUE;
@@ -1402,6 +1405,7 @@ namespace
             return true;
         }
 
+        NvencProfileScope mp4Scope(state->profile, Mp4Finalize);
         LogLine(state, L"finalize mp4 start");
         if (!FlushAudio(state))
         {
@@ -2558,7 +2562,11 @@ namespace
             lockBitstream.version = NV_ENC_LOCK_BITSTREAM_VER;
             lockBitstream.outputBitstream = bitstream;
             lockBitstream.doNotWait = 0;
-            auto status = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
+            NVENCSTATUS status;
+            {
+                NvencProfileScope lockScope(state->profile, LockBitstream);
+                status = state->funcs.nvEncLockBitstream(state->session, &lockBitstream);
+            }
             if (status == NV_ENC_SUCCESS)
             {
                 bool ok = true;
@@ -2581,6 +2589,7 @@ namespace
                         LogLine(state, L"EOS packet carried data beyond submitted frame count");
                     }
                     std::lock_guard<std::mutex> muxLock(state->muxMutex);
+                    NvencProfileScope muxScope(state->profile, BitstreamMux);
                     ok = ProcessEncodedBitstream(state,
                         static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
                         lockBitstream.bitstreamSizeInBytes,
@@ -2659,8 +2668,19 @@ namespace
             // The slot stays at the front of the FIFO until it is fully consumed,
             // so "FIFO empty" means "every submitted frame was muxed".
             auto& slot = state->slots[index];
-            bool ok = WaitForCompletionEvent(state, slot.completionEvent, L"nvEnc async slot")
-                && LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+            bool ok;
+            {
+                NvencProfileScope waitScope(state->profile, OutputEventWait);
+                ok = WaitForCompletionEvent(state, slot.completionEvent, L"nvEnc async slot");
+            }
+            if (ok)
+            {
+                ok = LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+            }
+            if (ok)
+            {
+                state->profile.Record(SlotResidence, slot.acquiredNs);
+            }
 
             std::lock_guard<std::mutex> lock(state->slotMutex);
             if (!ok)
@@ -3116,7 +3136,11 @@ namespace
         NV_ENC_MAP_INPUT_RESOURCE map{};
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = state->registeredNv12;
-        auto status = state->funcs.nvEncMapInputResource(state->session, &map);
+        NVENCSTATUS status;
+        {
+            NvencProfileScope mapScope(state->profile, MapInput);
+            status = state->funcs.nvEncMapInputResource(state->session, &map);
+        }
         if (!CheckStatus(state, status, L"nvEncMapInputResource failed"))
         {
             return false;
@@ -3134,7 +3158,10 @@ namespace
         pic.inputTimeStamp = frameId;
         pic.inputDuration = 1;
 
-        status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        {
+            NvencProfileScope encodeScope(state->profile, EncodePicture);
+            status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        }
         if (status == NV_ENC_ERR_NEED_MORE_INPUT)
         {
             state->funcs.nvEncUnmapInputResource(state->session, map.mappedResource);
@@ -3161,18 +3188,29 @@ namespace
         }
 
         size_t index = 0;
-        if (!AcquireSlot(state, index))
         {
-            return false;
+            NvencProfileScope slotWaitScope(state->profile, SlotWait);
+            if (!AcquireSlot(state, index))
+            {
+                return false;
+            }
         }
         auto& slot = state->slots[index];
+        slot.acquiredNs = state->profile.IsEnabled() ? NvencProfiler::Now() : 0;
 
-        state->deviceContext->CopyResource(slot.texture, texture);
+        {
+            NvencProfileScope copyScope(state->profile, CopyResourceCpu);
+            state->deviceContext->CopyResource(slot.texture, texture);
+        }
 
         NV_ENC_MAP_INPUT_RESOURCE map{};
         map.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
         map.registeredResource = slot.registered;
-        auto status = state->funcs.nvEncMapInputResource(state->session, &map);
+        NVENCSTATUS status;
+        {
+            NvencProfileScope mapScope(state->profile, MapInput);
+            status = state->funcs.nvEncMapInputResource(state->session, &map);
+        }
         if (!CheckStatus(state, status, L"nvEncMapInputResource failed"))
         {
             FreeSlot(state, index);
@@ -3196,7 +3234,10 @@ namespace
         pic.inputTimeStamp = slot.frameId;
         pic.inputDuration = 1;
 
-        status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        {
+            NvencProfileScope encodeScope(state->profile, EncodePicture);
+            status = state->funcs.nvEncEncodePicture(state->session, &pic);
+        }
         const bool needMoreInput = (status == NV_ENC_ERR_NEED_MORE_INPUT);
         if (needMoreInput)
         {
@@ -3224,6 +3265,10 @@ namespace
         if (!needMoreInput)
         {
             ok = LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+            if (ok)
+            {
+                state->profile.Record(SlotResidence, slot.acquiredNs);
+            }
         }
         FreeSlot(state, index);
         return ok;
@@ -3385,6 +3430,7 @@ namespace
                     continue;
                 }
 
+                NvencProfileScope writerScope(state->profile, WriterSample);
                 std::lock_guard<std::mutex> fileLock(state->fileMutex);
                 uint64_t offset = state->file.Tell();
                 if (!state->file.Write(sample.data.data(), sample.data.size()))
@@ -3517,6 +3563,7 @@ int NvencWriteAudio(void* handle, const float* samples, int sampleCount, int sam
     }
 
     // Audio and video share the muxer/writer state; the output thread takes the same mutex.
+    NvencProfileScope audioScope(state->profile, AudioWrite);
     std::lock_guard<std::mutex> muxLock(state->muxMutex);
     if (!InitializeAudioEncoder(state, sampleRate, channels))
     {
@@ -3571,6 +3618,7 @@ int NvencFinalize(void* handle)
     }
 
     state->drainRequested = true;
+    NvencProfileScope finalizeScope(state->profile, Finalize);
 
     // 1. Submit EOS on the dedicated buffer (no slot is borrowed).
     NV_ENC_OUTPUT_PTR eosBuffer = state->eosBitstream ? state->eosBitstream : state->bitstream;
@@ -3660,6 +3708,7 @@ int NvencFinalize(void* handle)
                         LogLine(state, L"EOS packet carried data beyond submitted frame count");
                     }
                     std::lock_guard<std::mutex> muxLock(state->muxMutex);
+                    NvencProfileScope muxScope(state->profile, BitstreamMux);
                     if (!ProcessEncodedBitstream(state,
                         static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
                         lockBitstream.bitstreamSizeInBytes,
@@ -3840,4 +3889,26 @@ const wchar_t* NvencGetLastError(void* handle)
     std::lock_guard<std::mutex> lock(state->errorMutex);
     snapshot = state->lastError;
     return snapshot.c_str();
+}
+
+int NvencEnableProfiling(void* handle)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || state->frameIndex != 0 || state->drainRequested)
+    {
+        return 0;
+    }
+    state->profile.enabled.store(true, std::memory_order_relaxed);
+    return 1;
+}
+
+int NvencGetProfile(void* handle, NvencProfileSnapshot* result, uint32_t resultSize)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !result || resultSize != sizeof(NvencProfileSnapshot))
+    {
+        return 0;
+    }
+    *result = state->profile.Snapshot(state->frameIndex, state->completedFrames);
+    return 1;
 }
