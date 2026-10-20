@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <algorithm>
 #include <thread>
 
 typedef void* (*PFN_Create)(ID3D11Device*, int, int, int, int, int, int, int, int, int, int, int, int, const wchar_t*);
@@ -23,6 +24,9 @@ typedef int (*PFN_Audio)(void*, const float*, int, int, int);
 typedef int (*PFN_Finalize)(void*);
 typedef void (*PFN_Destroy)(void*);
 typedef const wchar_t* (*PFN_Err)(void*);
+typedef int (*PFN_EnableOrdered)(void*);
+typedef void* (*PFN_CreateMember)(void*, int);
+typedef int (*PFN_EncodeEx)(void*, ID3D11Texture2D*, unsigned long long, int);
 
 // Stall watchdog: if no progress for 10 s, print where the harness is stuck.
 static std::atomic<int> g_frame{ -1 };
@@ -93,6 +97,7 @@ struct Opts
     std::wstring dll = L"NvencNative.dll", out = L"smoke.mp4";
     std::string codec = "h264";
     int frames = 600, width = 1920, height = 1080, fps = 60, pool = 6, hevcAsync = 0;
+    int sessions = 1, chunk = 0;
     int pregen = 0, mt = 0, sync = 0, quality = 1, audio = 1, cancelAt = -1, bitrate = 0, rc = 0, debugLog = 0, srgb = 0;
 };
 
@@ -129,6 +134,8 @@ static bool Parse(int argc, char** argv, Opts& o)
         else if (a == "--mt") o.mt = atoi(next()); // 1: harness enables ID3D10Multithread protection on the device
         else if (a == "--sync") o.sync = atoi(next()); // 0 none, 1 Flush, 2 wait on event query after rendering
         else if (a == "--pregen") o.pregen = atoi(next()); // K>0: pre-render K distinct frames, cycle them (no per-frame CPU upload)
+        else if (a == "--sessions") o.sessions = atoi(next()); // N>1: N NVENC sessions merged into one mp4 (NvencEnableOrderedMux)
+        else if (a == "--chunk") o.chunk = atoi(next());       // frames per chunk handed to a session (0 = fps*2, the GOP length)
         else if (a == "--srgb") o.srgb = atoi(next());
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return false; }
     }
@@ -158,6 +165,9 @@ int main(int argc, char** argv)
     auto finalize = (PFN_Finalize)GetProcAddress(mod, "NvencFinalize");
     auto destroy = (PFN_Destroy)GetProcAddress(mod, "NvencDestroy");
     auto lastErr = (PFN_Err)GetProcAddress(mod, "NvencGetLastError");
+    auto enableOrdered = (PFN_EnableOrdered)GetProcAddress(mod, "NvencEnableOrderedMux");
+    auto createMember = (PFN_CreateMember)GetProcAddress(mod, "NvencCreateMember");
+    auto encodeEx = (PFN_EncodeEx)GetProcAddress(mod, "NvencEncodeEx");
     if (!encode || !audio || !finalize || !destroy || !lastErr || (!create && !createPool)) { fprintf(stderr, "missing exports\n"); return 2; }
 
     // NVIDIA hardware adapter.
@@ -266,6 +276,135 @@ int main(int argc, char** argv)
         D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
         ID3D11Query* q = nullptr;
         if (SUCCEEDED(dev->CreateQuery(&qd, &q))) { ctx->End(q); BOOL done = FALSE; while (ctx->GetData(q, &done, sizeof(done), 0) == S_FALSE) {} q->Release(); }
+    }
+
+    if (o.sessions > 1)
+    {
+        // N sessions on one device feeding one muxer. Chunk c (frames [c*chunk, (c+1)*chunk)) goes to session
+        // c % N and starts with a forced IDR. Each session is fed from its own thread.
+        if (!enableOrdered || !createMember || !encodeEx) { fprintf(stderr, "DLL has no ordered-mux exports\n"); return 2; }
+        const int chunk = o.chunk > 0 ? o.chunk : o.fps * 2;
+        const int N = o.sessions;
+        if (!enableOrdered(h)) { printf("RESULT ok=0 stage=enable_ordered\n"); destroy(h); return 4; }
+        std::vector<void*> hs{ h };
+        for (int i = 1; i < N; ++i)
+        {
+            void* m = createMember(h, o.pool);
+            if (!m || (lastErr(m) && *lastErr(m)))
+            {
+                wprintf(L"member %d error: %ls\n", i, m && lastErr(m) ? lastErr(m) : L"(null)");
+                printf("RESULT ok=0 stage=create_member\n");
+                if (m) destroy(m);
+                for (size_t k = hs.size(); k-- > 1;) destroy(hs[k]);
+                destroy(h);
+                return 4;
+            }
+            hs.push_back(m);
+        }
+        printf("sessions=%d chunk=%d\n", N, chunk);
+        // Frame sources: pregen ring (speed test; markers wrap) or one texture per thread rendered on the fly (markers = frame index).
+        std::vector<ID3D11Texture2D*> ring2;
+        if (o.pregen > 0)
+        {
+            for (int k = 0; k < o.pregen; ++k)
+            {
+                ID3D11Texture2D* t = nullptr; ID3D11RenderTargetView* v = nullptr;
+                CHECK_HR(dev->CreateTexture2D(&td, nullptr, &t));
+                CHECK_HR(dev->CreateRenderTargetView(t, &rd, &v));
+                renderFrame(k, t, v);
+                v->Release();
+                ring2.push_back(t);
+            }
+            ctx->Flush();
+        }
+        std::atomic<int> failed{ -1 };
+        std::atomic<int> done{ 0 };
+        std::vector<std::thread> th;
+        auto tl = std::chrono::steady_clock::now();
+        g_stage = 2;
+        for (int si = 0; si < N; ++si)
+        {
+            th.emplace_back([&, si]()
+            {
+                ID3D11Texture2D* mine = nullptr; ID3D11RenderTargetView* myv = nullptr;
+                if (o.pregen <= 0)
+                {
+                    dev->CreateTexture2D(&td, nullptr, &mine);
+                    dev->CreateRenderTargetView(mine, &rd, &myv);
+                }
+                std::vector<uint32_t> mystrip(kMarkerBits * kMarkerBlock * kMarkerBlock);
+                std::vector<uint32_t> myrect(128 * 128, 0xFFFF8000u);
+                for (int c = si; (long long)c * chunk < o.frames && failed < 0; c += N)
+                {
+                    int a = c * chunk, b = std::min(a + chunk, o.frames);
+                    for (int f = a; f < b && failed < 0; ++f)
+                    {
+                        ID3D11Texture2D* cur;
+                        if (o.pregen > 0) cur = ring2[f % o.pregen];
+                        else
+                        {
+                            float bg[4] = { (float)(f % 64) / 255.0f, 0.2f, 0.1f, 1.0f };
+                            ctx->ClearRenderTargetView(myv, bg);
+                            for (int bit = 0; bit < kMarkerBits; ++bit)
+                            {
+                                uint32_t col = ((f >> bit) & 1) ? 0xFFFFFFFFu : 0xFF000000u;
+                                for (int y = 0; y < kMarkerBlock; ++y)
+                                    for (int x = 0; x < kMarkerBlock; ++x)
+                                        mystrip[y * kMarkerBits * kMarkerBlock + bit * kMarkerBlock + x] = col;
+                            }
+                            D3D11_BOX box = { 0, 0, 0, (UINT)(kMarkerBits * kMarkerBlock), (UINT)kMarkerBlock, 1 };
+                            ctx->UpdateSubresource(mine, 0, &box, mystrip.data(), kMarkerBits * kMarkerBlock * 4, 0);
+                            int rx = (f * 7) % (o.width - 128), ry = kMarkerBlock + 8 + (f * 3) % (o.height - 128 - kMarkerBlock - 8);
+                            D3D11_BOX rb = { (UINT)rx, (UINT)ry, 0, (UINT)rx + 128, (UINT)ry + 128, 1 };
+                            ctx->UpdateSubresource(mine, 0, &rb, myrect.data(), 128 * 4, 0);
+                            cur = mine;
+                        }
+                        if (!encodeEx(hs[si], cur, (unsigned long long)f, f == a ? 1 : 0)) { int e = -1; failed.compare_exchange_strong(e, f); break; }
+                        int d = ++done; g_frame = d;
+                    }
+                }
+            });
+        }
+        std::thread aud;
+        if (o.audio)
+        {
+            aud = std::thread([&]()
+            {
+                double carry = 0, ph = 0; std::vector<float> ab;
+                for (int f = 0; f < o.frames && failed < 0; ++f)
+                {
+                    while (done.load() + 2 * chunk < f && failed < 0) Sleep(1);   // keep audio roughly level with video
+                    carry += (double)sr / o.fps; int n = (int)carry; carry -= n;
+                    ab.resize((size_t)n * ch);
+                    for (int i = 0; i < n; ++i) { float v = 0.25f * sinf((float)ph); ph += 2.0 * 3.14159265358979 * 440.0 / sr; ab[i * 2] = v; ab[i * 2 + 1] = v; }
+                    if (!audio(h, ab.data(), (int)ab.size(), sr, ch)) { int e = -1; failed.compare_exchange_strong(e, f); break; }
+                }
+            });
+        }
+        for (auto& t : th) t.join();
+        if (aud.joinable()) aud.join();
+        auto tf = std::chrono::steady_clock::now();
+        if (failed >= 0)
+        {
+            for (size_t k = 0; k < hs.size(); ++k) if (lastErr(hs[k]) && *lastErr(hs[k])) wprintf(L"session %zu error: %ls\n", k, lastErr(hs[k]));
+            printf("RESULT ok=0 stage=encode frame=%d\n", failed.load());
+            for (size_t k = hs.size(); k-- > 1;) destroy(hs[k]);
+            destroy(h);
+            return 5;
+        }
+        g_stage = 4;
+        int fin = 1;
+        for (size_t k = 1; k < hs.size(); ++k) if (!finalize(hs[k])) { fin = 0; wprintf(L"member %zu finalize error: %ls\n", k, lastErr(hs[k])); }
+        if (fin && !finalize(h)) { fin = 0; wprintf(L"primary finalize error: %ls\n", lastErr(h)); }
+        auto tEnd = std::chrono::steady_clock::now();
+        g_stage = 5;
+        for (size_t k = hs.size(); k-- > 1;) destroy(hs[k]);
+        destroy(h);
+        g_stage = 9;
+        double wall = Ms(tCreated, tEnd), loop = Ms(tl, tf);
+        printf("RESULT ok=%d mode=full sessions=%d chunk=%d frames=%d create_ms=%.1f encode_loop_ms=%.1f finalize_ms=%.1f wall_ms=%.1f fps=%.1f\n",
+            fin, N, chunk, o.frames, Ms(t0, tCreated), loop, Ms(tf, tEnd), wall, o.frames * 1000.0 / wall);
+        return fin ? 0 : 6;
     }
     double renderMs = 0;
     g_stage = 1;
