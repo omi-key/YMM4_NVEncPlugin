@@ -72,6 +72,23 @@ extern "C" {
 
     __declspec(dllexport) int NvencEncode(void* handle, ID3D11Texture2D* texture);
 
+    // ---- Multi-session ordered mux (append-only; the entry points above are unchanged) ----
+    // A primary encoder (NvencCreate/NvencCreateWithPool) can drive additional NVENC sessions on the same
+    // device whose packets are merged into the primary's single MP4 muxer in ascending sequence order.
+    // 1. NvencEnableOrderedMux(primary) before the first frame. Returns 1 on success, 0 if unsupported
+    //    (needs the async texture pool and H.264/HEVC). From then on the primary must be fed with NvencEncodeEx.
+    __declspec(dllexport) int NvencEnableOrderedMux(void* primary);
+    // 2. NvencCreateMember(primary, poolSize): a further session with the primary's configuration and no
+    //    output file. Always returns a handle once the primary is valid; check NvencGetLastError (non-empty
+    //    means it failed and must be destroyed). Returns null if the primary is not in ordered-mux mode.
+    __declspec(dllexport) void* NvencCreateMember(void* primary, int texturePoolSize);
+    // 3. NvencEncodeEx: like NvencEncode, plus the frame's global position `sequence` (0, 1, 2, ... each
+    //    used exactly once across all sessions) and flags (bit 0 = force an IDR). Each session must be fed
+    //    from one thread at a time; sessions may be fed concurrently.
+    __declspec(dllexport) int NvencEncodeEx(void* handle, ID3D11Texture2D* texture, uint64_t sequence, int flags);
+    // 4. Finalize every member (drains it; writes nothing), then the primary (checks that no sequence gap
+    //    remains and writes the MP4). Destroy members before the primary.
+
     __declspec(dllexport) int NvencWriteAudio(void* handle, const float* samples, int sampleCount, int sampleRate, int channels);
 
     __declspec(dllexport) int NvencFinalize(void* handle);

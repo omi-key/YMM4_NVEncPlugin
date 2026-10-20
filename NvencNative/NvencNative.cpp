@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -214,6 +215,7 @@ namespace
             bool eventRegistered = false;
             SlotState state = SlotState::Free;      // guarded by slotMutex
             uint64_t frameId = 0;
+            uint64_t seq = 0;                       // ordered-mux position (group mode only)
             uint64_t acquiredNs = 0;                // profiling only; 0 when disabled
         };
         std::vector<InputSlot> slots;               // sized once at init, never resized afterwards
@@ -285,6 +287,27 @@ namespace
         uint64_t completedFrames = 0;
         bool logEnabled = false;
         HANDLE logFile = INVALID_HANDLE_VALUE;
+
+        // Multi-session ("group") mux. One primary owns the MP4 writer; any number of members are extra NVENC
+        // sessions (same device and config, no file) whose packets are merged into the primary's muxer in
+        // ascending sequence order (the caller's global frame index). Everything below is unused unless
+        // NvencEnableOrderedMux was called, so the single-session path is unchanged.
+        EncoderState* muxOwner = nullptr;           // member: the primary that receives our packets
+        bool orderedMux = false;                    // primary: packets are merged by sequence number
+        uint64_t orderNext = 0;                     // primary: next sequence number to hand to the writer (muxMutex)
+        struct PendingPacket
+        {
+            std::vector<uint8_t> data;
+            NV_ENC_PIC_TYPE pictureType = NV_ENC_PIC_TYPE_P;
+        };
+        std::map<uint64_t, PendingPacket> orderPending;  // primary: out-of-order packets (muxMutex)
+        std::vector<uint8_t> groupParamSets;        // primary: SPS/PPS (VPS/SPS/PPS) of the first IDR, for the cross-session check
+        // Creation parameters, kept so a member can be created with an identical configuration.
+        int createBitrateKbps = 0;
+        int createQuality = 0;
+        int createRateControl = 0;
+        int createMaxBitrateKbps = 0;
+        int createHevcAsync = 0;
     };
 
     bool IsHevc(const EncoderState* state)
@@ -2582,9 +2605,71 @@ namespace
         return true;
     }
 
+    // Ordered mux (group mode). Called under owner->muxMutex. Packets arrive from several sessions in any
+    // order; they are handed to the primary's writer strictly in ascending sequence order. The first IDR of
+    // every session must carry the same parameter sets as the first one seen: the MP4 stores a single
+    // avcC/hvcC, so a session that encoded different parameter sets would produce an undecodable file.
+    bool GroupSubmit(EncoderState* owner, uint64_t seq, const uint8_t* data, size_t size, NV_ENC_PIC_TYPE picType)
+    {
+        if (seq < owner->orderNext || owner->orderPending.count(seq))
+        {
+            SetError(owner, L"ordered mux: duplicate or stale sequence number " + std::to_wstring(seq));
+            return false;
+        }
+
+        if (size > 0 && picType == NV_ENC_PIC_TYPE_IDR && owner->codec != kCodecAv1)
+        {
+            const bool hevc = IsHevc(owner);
+            std::vector<uint8_t> sets;
+            for (const auto& unit : ParseAnnexB(data, size, hevc))
+            {
+                const bool isSet = hevc ? (unit.type >= 32 && unit.type <= 34) : (unit.type == 7 || unit.type == 8);
+                if (isSet)
+                {
+                    sets.push_back(unit.type);
+                    sets.insert(sets.end(), unit.data, unit.data + unit.size);
+                }
+            }
+            if (!sets.empty())
+            {
+                if (owner->groupParamSets.empty())
+                {
+                    owner->groupParamSets = std::move(sets);
+                }
+                else if (owner->groupParamSets != sets)
+                {
+                    SetError(owner, L"ordered mux: sessions produced different parameter sets (sequence "
+                        + std::to_wstring(seq) + L").");
+                    return false;
+                }
+            }
+        }
+
+        EncoderState::PendingPacket packet;
+        if (size > 0)
+        {
+            packet.data.assign(data, data + size);
+        }
+        packet.pictureType = picType;
+        owner->orderPending.emplace(seq, std::move(packet));
+
+        while (!owner->orderPending.empty() && owner->orderPending.begin()->first == owner->orderNext)
+        {
+            auto& next = owner->orderPending.begin()->second;
+            if (!next.data.empty()
+                && !ProcessEncodedBitstream(owner, next.data.data(), next.data.size(), next.pictureType))
+            {
+                return false;
+            }
+            owner->orderPending.erase(owner->orderPending.begin());
+            ++owner->orderNext;
+        }
+        return true;
+    }
+
     // Lock the bitstream, hand it to the muxer (under muxMutex), unlock.
     // Used by the output thread (async), the render thread (sync) and finalize (EOS).
-    bool LockAndProcessBitstream(EncoderState* state, NV_ENC_OUTPUT_PTR bitstream, bool checkTimestamp, uint64_t expectedFrameId, bool isEos)
+    bool LockAndProcessBitstream(EncoderState* state, NV_ENC_OUTPUT_PTR bitstream, bool checkTimestamp, uint64_t expectedFrameId, bool isEos, uint64_t seq = 0)
     {
         const DWORD maxWaitMs = 5000;
         DWORD waited = 0;
@@ -2608,6 +2693,26 @@ namespace
                         + std::to_wstring(expectedFrameId) + L", got "
                         + std::to_wstring(lockBitstream.outputTimeStamp) + L").");
                     ok = false;
+                }
+                else if (state->muxOwner || state->orderedMux)
+                {
+                    // Group mode: merge into the primary's muxer by sequence number. A frame that produced no
+                    // bytes still registers its sequence number so the merge cannot stall on a gap.
+                    if (lockBitstream.bitstreamSizeInBytes > 0)
+                    {
+                        ++state->completedFrames;
+                    }
+                    EncoderState* owner = state->muxOwner ? state->muxOwner : state;
+                    std::lock_guard<std::mutex> muxLock(owner->muxMutex);
+                    NvencProfileScope muxScope(state->profile, BitstreamMux);
+                    ok = GroupSubmit(owner, seq,
+                        static_cast<uint8_t*>(lockBitstream.bitstreamBufferPtr),
+                        lockBitstream.bitstreamSizeInBytes,
+                        lockBitstream.pictureType);
+                    if (!ok && state != owner && !HasError(state))
+                    {
+                        SetError(state, L"ordered mux failed (see the primary encoder's error).");
+                    }
                 }
                 else if (lockBitstream.bitstreamSizeInBytes > 0)
                 {
@@ -2707,7 +2812,7 @@ namespace
             }
             if (ok)
             {
-                ok = LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false);
+                ok = LockAndProcessBitstream(state, slot.bitstream, true, slot.frameId, false, slot.seq);
             }
             if (ok)
             {
@@ -3226,7 +3331,7 @@ namespace
         return ok;
     }
 
-    bool EncodeTexturePooled(EncoderState* state, ID3D11Texture2D* texture)
+    bool EncodeTexturePooled(EncoderState* state, ID3D11Texture2D* texture, bool hasSeq = false, uint64_t seq = 0, bool forceIdr = false)
     {
         if (!state->poolReady || state->slots.empty() || !state->deviceContext)
         {
@@ -3266,8 +3371,13 @@ namespace
         slot.mapped = map.mappedResource;
 
         slot.frameId = state->frameIndex++;
+        slot.seq = seq;
         NV_ENC_PIC_PARAMS pic{};
         pic.version = NV_ENC_PIC_PARAMS_VER;
+        if (forceIdr)
+        {
+            pic.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR;
+        }
         pic.inputBuffer = slot.mapped;
         pic.bufferFmt = state->bufferFormat;
         pic.inputWidth = state->width;
@@ -3321,10 +3431,17 @@ namespace
         return ok;
     }
 
-    bool EncodeTexture(EncoderState* state, ID3D11Texture2D* texture)
+    bool EncodeTexture(EncoderState* state, ID3D11Texture2D* texture, bool hasSeq = false, uint64_t seq = 0, bool forceIdr = false)
     {
         if (!state || !texture)
         {
+            return false;
+        }
+
+        // In ordered-mux mode every frame must say where it goes in the output (NvencEncodeEx).
+        if ((state->muxOwner || state->orderedMux) && !hasSeq)
+        {
+            SetError(state, L"NvencEncode cannot be used in ordered-mux mode; use NvencEncodeEx.");
             return false;
         }
 
@@ -3337,7 +3454,7 @@ namespace
         {
             return EncodeTextureNv12Sync(state, texture);
         }
-        return EncodeTexturePooled(state, texture);
+        return EncodeTexturePooled(state, texture, hasSeq, seq, forceIdr);
     }
 
     bool EnsureVideoProcessor(EncoderState* state)
@@ -3541,6 +3658,11 @@ namespace
         state->outputPath = outputPath;
         state->logEnabled = enableDebugLog != 0;
         state->poolSize = ResolveTexturePoolSize(texturePoolSize);
+        state->createBitrateKbps = bitrateKbps;
+        state->createQuality = quality;
+        state->createRateControl = rateControlMode;
+        state->createMaxBitrateKbps = maxBitrateKbps;
+        state->createHevcAsync = hevcAsync;
         OpenLog(state);
         LogLine(state, L"create encoder");
 
@@ -3583,6 +3705,72 @@ int NvencGetPoolSize(void* handle)
         return 0;
     }
     return state->poolSize;
+}
+
+int NvencEnableOrderedMux(void* handle)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !state->session || state->muxOwner || state->orderedMux || state->frameIndex != 0)
+    {
+        return 0;
+    }
+    // Group mode needs the async slot pool (the output thread merges packets) and an Annex B codec.
+    if (!state->asyncEnabled || state->fastPreset != 0 || state->codec == kCodecAv1 || !state->poolReady)
+    {
+        return 0;
+    }
+    state->orderedMux = true;
+    state->orderNext = 0;
+    return 1;
+}
+
+void* NvencCreateMember(void* primaryHandle, int texturePoolSize)
+{
+    auto* primary = reinterpret_cast<EncoderState*>(primaryHandle);
+    if (!primary || !primary->orderedMux || primary->muxOwner || primary->frameIndex != 0 || !primary->device)
+    {
+        return nullptr;
+    }
+
+    auto* state = new EncoderState();
+    state->muxOwner = primary;
+    state->mp4Finalized = true;   // no file of its own: Destroy must not try to finalize one
+    state->outputPath = primary->outputPath + L".member" + std::to_wstring(reinterpret_cast<uintptr_t>(state) & 0xFFFF);
+    state->logEnabled = primary->logEnabled;
+    state->poolSize = ResolveTexturePoolSize(texturePoolSize);
+    OpenLog(state);
+    LogLine(state, L"create member encoder");
+
+    if (!InitializeEncoder(state, primary->device, primary->width, primary->height, primary->fps,
+        primary->createBitrateKbps, primary->codec, primary->createQuality, primary->fastPreset,
+        primary->createRateControl, primary->createMaxBitrateKbps, primary->originalBufferFormat, primary->createHevcAsync))
+    {
+        return state;   // caller reads NvencGetLastError, then destroys it
+    }
+    if (!state->asyncEnabled)
+    {
+        SetError(state, L"member encoder needs async mode.");
+        return state;
+    }
+    StartOutputThread(state);
+    LogLine(state, L"member encoder initialized");
+    return state;
+}
+
+int NvencEncodeEx(void* handle, ID3D11Texture2D* texture, uint64_t sequence, int flags)
+{
+    auto* state = reinterpret_cast<EncoderState*>(handle);
+    if (!state || !texture)
+    {
+        return 0;
+    }
+
+    if (!EncodeTexture(state, texture, true, sequence, (flags & 1) != 0))
+    {
+        return 0;
+    }
+
+    return 1;
 }
 
 int NvencEncode(void* handle, ID3D11Texture2D* texture)
@@ -3754,6 +3942,11 @@ int NvencFinalize(void* handle)
                     {
                         LogLine(state, L"EOS packet carried data beyond submitted frame count");
                     }
+                    if (state->muxOwner || state->orderedMux)
+                    {
+                        SetError(state, L"EOS packet carried data in ordered-mux mode.");
+                        return 0;
+                    }
                     std::lock_guard<std::mutex> muxLock(state->muxMutex);
                     NvencProfileScope muxScope(state->profile, BitstreamMux);
                     if (!ProcessEncodedBitstream(state,
@@ -3785,9 +3978,21 @@ int NvencFinalize(void* handle)
         return 0;
     }
 
+    if (state->muxOwner)
+    {
+        // Member session: drained, nothing to finalize (the primary owns the file).
+        return 1;
+    }
+
     bool finalized = false;
     {
         std::lock_guard<std::mutex> muxLock(state->muxMutex);
+        if (state->orderedMux && !state->orderPending.empty())
+        {
+            SetError(state, L"ordered mux: " + std::to_wstring(state->orderPending.size())
+                + L" packet(s) are still waiting for an earlier sequence number (a session was not finalized or a frame is missing).");
+            return 0;
+        }
         finalized = FinalizeMp4(state);
     }
     return finalized ? 1 : 0;
