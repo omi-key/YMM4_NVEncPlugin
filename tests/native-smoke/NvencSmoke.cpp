@@ -93,7 +93,7 @@ struct Opts
     std::wstring dll = L"NvencNative.dll", out = L"smoke.mp4";
     std::string codec = "h264";
     int frames = 600, width = 1920, height = 1080, fps = 60, pool = 6, hevcAsync = 0;
-    int mt = 0, sync = 0, quality = 1, audio = 1, cancelAt = -1, bitrate = 0, rc = 0, debugLog = 0, srgb = 0;
+    int pregen = 0, mt = 0, sync = 0, quality = 1, audio = 1, cancelAt = -1, bitrate = 0, rc = 0, debugLog = 0, srgb = 0;
 };
 
 static std::wstring W(const char* s)
@@ -128,6 +128,7 @@ static bool Parse(int argc, char** argv, Opts& o)
         else if (a == "--debug-log") o.debugLog = atoi(next());
         else if (a == "--mt") o.mt = atoi(next()); // 1: harness enables ID3D10Multithread protection on the device
         else if (a == "--sync") o.sync = atoi(next()); // 0 none, 1 Flush, 2 wait on event query after rendering
+        else if (a == "--pregen") o.pregen = atoi(next()); // K>0: pre-render K distinct frames, cycle them (no per-frame CPU upload)
         else if (a == "--srgb") o.srgb = atoi(next());
         else { fprintf(stderr, "unknown arg %s\n", a.c_str()); return false; }
     }
@@ -218,19 +219,10 @@ int main(int argc, char** argv)
     int failedAt = -1;
     double encodeMs = 0;
 
-    g_stage = 1;
-    for (int f = 0; f < o.frames; ++f)
+    auto renderFrame = [&](int f, ID3D11Texture2D* t, ID3D11RenderTargetView* v)
     {
-        g_frame = f; g_stage = 1;
-        if (o.cancelAt >= 0 && f == o.cancelAt)
-        {
-            auto tc = std::chrono::steady_clock::now();
-            destroy(h);
-            printf("RESULT ok=1 mode=cancel frames=%d destroy_ms=%.1f\n", f, Ms(tc, std::chrono::steady_clock::now()));
-            return 0;
-        }
         float bg[4] = { (float)(f % 64) / 255.0f, 0.2f, 0.1f, 1.0f };
-        ctx->ClearRenderTargetView(rtv, bg);
+        ctx->ClearRenderTargetView(v, bg);
         for (int b = 0; b < kMarkerBits; ++b)
         {
             uint32_t c = ((f >> b) & 1) ? 0xFFFFFFFFu : 0xFF000000u;
@@ -239,10 +231,10 @@ int main(int argc, char** argv)
                     strip[y * kMarkerBits * kMarkerBlock + b * kMarkerBlock + x] = c;
         }
         D3D11_BOX box = { 0, 0, 0, (UINT)(kMarkerBits * kMarkerBlock), (UINT)kMarkerBlock, 1 };
-        ctx->UpdateSubresource(tex, 0, &box, strip.data(), kMarkerBits * kMarkerBlock * 4, 0);
+        ctx->UpdateSubresource(t, 0, &box, strip.data(), kMarkerBits * kMarkerBlock * 4, 0);
         int rx = (f * 7) % (o.width - 128), ry = kMarkerBlock + 8 + (f * 3) % (o.height - 128 - kMarkerBlock - 8);
         D3D11_BOX rb = { (UINT)rx, (UINT)ry, 0, (UINT)rx + 128, (UINT)ry + 128, 1 };
-        ctx->UpdateSubresource(tex, 0, &rb, rect.data(), 128 * 4, 0);
+        ctx->UpdateSubresource(t, 0, &rb, rect.data(), 128 * 4, 0);
 
         if (o.sync == 1) ctx->Flush();
         else if (o.sync == 2)
@@ -257,9 +249,46 @@ int main(int argc, char** argv)
                 q->Release();
             }
         }
+    };
+    std::vector<ID3D11Texture2D*> ring;
+    if (o.pregen > 0)
+    {
+        for (int k = 0; k < o.pregen; ++k)
+        {
+            ID3D11Texture2D* t = nullptr; ID3D11RenderTargetView* v = nullptr;
+            CHECK_HR(dev->CreateTexture2D(&td, nullptr, &t));
+            CHECK_HR(dev->CreateRenderTargetView(t, &rd, &v));
+            renderFrame(k, t, v);
+            v->Release();
+            ring.push_back(t);
+        }
+        ctx->Flush();
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+        ID3D11Query* q = nullptr;
+        if (SUCCEEDED(dev->CreateQuery(&qd, &q))) { ctx->End(q); BOOL done = FALSE; while (ctx->GetData(q, &done, sizeof(done), 0) == S_FALSE) {} q->Release(); }
+    }
+    double renderMs = 0;
+    g_stage = 1;
+    for (int f = 0; f < o.frames; ++f)
+    {
+        g_frame = f; g_stage = 1;
+        if (o.cancelAt >= 0 && f == o.cancelAt)
+        {
+            auto tc = std::chrono::steady_clock::now();
+            destroy(h);
+            printf("RESULT ok=1 mode=cancel frames=%d destroy_ms=%.1f\n", f, Ms(tc, std::chrono::steady_clock::now()));
+            return 0;
+        }
+        ID3D11Texture2D* cur = tex;
+        if (o.pregen > 0) cur = ring[f % o.pregen];
+        else {
+            auto tr = std::chrono::steady_clock::now();
+            renderFrame(f, tex, rtv);
+            renderMs += Ms(tr, std::chrono::steady_clock::now());
+        }
         g_stage = 2;
         auto te = std::chrono::steady_clock::now();
-        int r = encode(h, tex);
+        int r = encode(h, cur);
         encodeMs += Ms(te, std::chrono::steady_clock::now());
         if (!r) { failedAt = f; break; }
 
@@ -294,7 +323,7 @@ int main(int argc, char** argv)
     destroy(h);
     g_stage = 9;
     double wall = Ms(tCreated, tEnd);
-    printf("RESULT ok=%d mode=full frames=%d create_ms=%.1f encode_loop_ms=%.1f finalize_ms=%.1f wall_ms=%.1f fps=%.1f\n",
-        fin ? 1 : 0, o.frames, Ms(t0, tCreated), encodeMs, Ms(tf, tEnd), wall, o.frames * 1000.0 / wall);
+    printf("RESULT ok=%d mode=full frames=%d create_ms=%.1f render_ms=%.1f encode_loop_ms=%.1f finalize_ms=%.1f wall_ms=%.1f fps=%.1f\n",
+        fin ? 1 : 0, o.frames, Ms(t0, tCreated), renderMs, encodeMs, Ms(tf, tEnd), wall, o.frames * 1000.0 / wall);
     return fin ? 0 : 6;
 }

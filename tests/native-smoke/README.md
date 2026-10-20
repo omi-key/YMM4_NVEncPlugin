@@ -27,11 +27,12 @@ the exe from WSL via interop (the DLL needs the Windows NVIDIA driver, nvEncodeA
     NvencSmoke.exe --dll C:\path\NvencNative.dll --out C:\path\o.mp4 --codec h264|hevc|av1 \
         --frames 600 --width 1920 --height 1080 --fps 60 --pool 6 --hevc-async 0|1 \
         --quality 0|1|2 --audio 0|1 [--cancel-at N] [--bitrate kbps] [--rc 0|1] \
-        [--debug-log 1] [--srgb 1] [--sync 0|1|2] [--mt 0|1]
+        [--debug-log 1] [--srgb 1] [--sync 0|1|2] [--mt 0|1] [--pregen K]
 
 * `--cancel-at N`: call `NvencDestroy` without `NvencFinalize` at frame N (cancel path).
 * `--sync`: 0 nothing, 1 `Flush()`, 2 wait on an event query after rendering (before encode).
 * `--mt 1`: harness itself enables `ID3D10Multithread` protection (the DLL now does this too).
+* `--pregen K`: render K distinct frames up front and cycle them, so the loop has no per-frame CPU upload (`render_ms` in the RESULT line is the time spent generating frames; with `--pregen` it is 0). Use it to measure pure encode speed.
 * `--debug-log 1`: plugin writes `<out>.nvenc_log.txt`.
 * A watchdog prints `STALL stage=... frame=...` plus module+offset of every thread's stack
   if no progress for 10 s. Always run with an external timeout and `taskkill.exe` a hung exe.
